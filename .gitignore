@@ -1,0 +1,20 @@
+# Local Python environments
+.venv/
+.venv-*/
+venv/
+
+# Python build and runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.runtime.lock
+
+# Local configuration and repository recovery backup
+.env
+.lilith-git-backup/
+*.bundle
