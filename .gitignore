@@ -13,8 +13,19 @@ dist/
 *.db-wal
 *.db-shm
 *.runtime.lock
+logs/
+service.log
+service.previous.log
+quarantine/
+tools/experimental/
+backups/
+*.log
 
 # Local configuration and repository recovery backup
 .env
+.env.*
+!.env.example
+credentials.json
+secrets.json
 .lilith-git-backup/
 *.bundle

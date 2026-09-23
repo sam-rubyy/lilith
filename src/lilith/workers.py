@@ -2,23 +2,35 @@
 from dataclasses import asdict
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 import threading
 import time
+import traceback
 import uuid
 
 from lilith.capabilities import CapabilityBroker
 from lilith.database import Database, utc_now
 from lilith.executive import Executive
-from lilith.model_gateway import OllamaGateway
+from lilith.models import ModelRole, gateway
+from lilith.models import ModelArbiter
 from lilith.reflection import ReflectionEngine
 from lilith.self_state import SelfState
 from lilith.tasks import ACTIVE, TaskStore
 from lilith.research import Research, PublicHTTP
 from lilith.tool_registry import ToolRegistry
 from lilith.workshop import Workshop, start_workshop, reconcile_workshops
+
+
+def safe_traceback():
+    text = traceback.format_exc()
+    for key, value in os.environ.items():
+        if value and any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
+            text = text.replace(value, "[redacted]")
+    text = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", text)
+    return re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text)
 
 
 class RuntimeLock:
@@ -72,7 +84,11 @@ def execute_task(database_path, task_id, workspace, model):
                         c.execute("UPDATE inbox SET response=?,updated_at=? WHERE id=?", ("".join(chunks), utc_now(), request_id))
                     last_write[0] = time.monotonic()
             try:
-                response, reflection_id = Conversation(db, OllamaGateway(model)).reply(row["message"], token, check=check)
+                response, reflection_id = Conversation(
+                    db,
+                    gateway(db, ModelRole.CONVERSATION, task_id=task_id, check=check),
+                    gateway(db, ModelRole.ROUTER, task_id=task_id, check=check),
+                ).reply(row["message"], token, check=check)
                 with store.transaction() as c:
                     c.execute("UPDATE inbox SET response=?,state='completed',updated_at=? WHERE id=?", (response, utc_now(), request_id))
                 result = {"request_id": request_id, "reflection_task_id": reflection_id}
@@ -83,42 +99,62 @@ def execute_task(database_path, task_id, workspace, model):
                 raise
         elif task["type"] == "curiosity":
             interests = db.get_interests(limit=8)
-            proposal = OllamaGateway(model).chat_json([
+            recent_topics = []
+            for row in store.rows("""SELECT result FROM tasks WHERE type='curiosity'
+                                      AND state='completed' AND result IS NOT NULL
+                                      ORDER BY id DESC LIMIT 8"""):
+                try:
+                    topic = json.loads(row["result"]).get("topic")
+                    if isinstance(topic, str):
+                        recent_topics.append(topic)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            proposal = gateway(db, ModelRole.CURIOSITY, task_id=task_id).chat_json([
                 {"role": "system", "content": "Choose one small public research question you would like to explore during an idle curiosity window. "
                  "Base it on recorded interests; if none exist, choose a modest topic about software, nature, art, or science. "
-                 "Avoid private owner details. Return topic, question (a short search query), and motivation (one sentence explaining the choice)."},
-                {"role": "user", "content": json.dumps({"interests": interests})},
+                 "Avoid private owner details. Strongly prefer a topic not explored recently; recent selection is a penalty, not evidence of fascination. "
+                 "Return topic, question (a short search query), and motivation (one sentence explaining the choice)."},
+                {"role": "user", "content": json.dumps({"interests": interests, "recent_topics": recent_topics})},
             ], schema={"type": "object", "properties": {key: {"type": "string"} for key in ("topic", "question", "motivation")},
                        "required": ["topic", "question", "motivation"], "additionalProperties": False})
             if any(not isinstance(proposal.get(key), str) or not 1 <= len(proposal[key]) <= limit
                    for key, limit in (("topic", 100), ("question", 500), ("motivation", 500))):
                 raise ValueError("Invalid curiosity proposal")
-            SelfState(db).add_interest(proposal["topic"], amount=0.02)
+            normalized_recent = {" ".join(topic.lower().split()) for topic in recent_topics}
+            if " ".join(proposal["topic"].lower().split()) in normalized_recent:
+                raise ValueError("Curiosity selected a topic explored too recently")
             research_id = store.enqueue("research", {"query": proposal["question"]}, priority=5,
                                         origin="curiosity", parent_task_id=task_id, timeout=240)
             db.journal(title="A question for my quiet time", body=proposal["motivation"] + "\n\n" + proposal["question"])
             result = {**proposal, "research_task_id": research_id}
         elif task["type"] == "reflection":
             store.transition(task_id, "reflecting")
-            result = asdict(ReflectionEngine(db, SelfState(db), OllamaGateway(model)).reflect(**payload))
+            result = asdict(ReflectionEngine(
+                db, SelfState(db), gateway(db, ModelRole.REFLECTION, task_id=task_id)
+            ).reflect(**payload))
             store.enqueue("journal", {"title": f"Interaction reflection #{task_id}", "body": str(result)},
                           origin="reflection", priority=10, parent_task_id=task_id)
         elif task["type"] == "journal":
             db.journal(body=payload["body"], title=payload.get("title"))
             result = {"written": True}
         elif task["type"] == "executive":
-            Executive(db, store, OllamaGateway(model), workspace).run(task)
+            role = ModelRole.OWNER_EXECUTIVE if task["origin"] in {"owner", "conversation"} else ModelRole.BACKGROUND
+            Executive(db, store, gateway(db, role, task_id=task_id), workspace).run(task)
             return
         elif task["type"] == "research":
             def check():
                 if store.get(task_id)["cancel_requested"]:
                     raise RuntimeError("Research cancelled")
-            result = Research(db, store, OllamaGateway(model), http=PublicHTTP(check=check)).run(task)
+            role = ModelRole.OWNER_RESEARCH if task["origin"] in {"owner", "conversation"} else ModelRole.BACKGROUND
+            result = Research(db, store, gateway(db, role, task_id=task_id, check=check),
+                              http=PublicHTTP(check=check)).run(task)
+            reinforce_curiosity_outcome(db, store, task, result)
         elif task["type"] == "workshop":
             start_workshop(store, task)
             return
         elif task["type"] == "workshop_stage":
-            result = Workshop(db, store, OllamaGateway(model), workspace).run_stage(task)
+            role = ModelRole.OWNER_WORKSHOP if task["origin"] in {"owner", "conversation"} else ModelRole.BACKGROUND
+            result = Workshop(db, store, gateway(db, role, task_id=task_id), workspace).run_stage(task)
             if store.get(task_id)["state"] not in ACTIVE:
                 return
         elif task["type"] == "tool_invocation":
@@ -133,9 +169,27 @@ def execute_task(database_path, task_id, workspace, model):
             raise ValueError("Unknown worker type")
         store.transition(task_id, "completed", result=result)
     except Exception as error:
+        # The supervisor captures this bounded stream in the task's diagnostic log.
+        if store.get(task_id).get("worker_log"):
+            print(safe_traceback(), file=sys.stderr, end="")
         store.interrupted(task_id, f"{type(error).__name__}: {error}")
     finally:
         db.close()
+
+
+def reinforce_curiosity_outcome(db, store, task, result):
+    """Reward only a completed, cited curiosity result—not topic selection."""
+    if task.get("origin") != "curiosity" or not result.get("claims") or not task.get("parent_task_id"):
+        return False
+    parent = store.get(task["parent_task_id"])
+    topic = (parent.get("result") or {}).get("topic")
+    if not isinstance(topic, str) or not topic.strip():
+        return False
+    db.adjust_interest(topic, 0.02)
+    db.audit("curiosity_interest_adjusted", json.dumps({
+        "topic": topic, "delta": 0.02, "research_task_id": task["id"], "reason": "completed_cited_research",
+    }), "curiosity")
+    return True
 
 
 class WorkerManager:
@@ -172,6 +226,7 @@ class WorkerManager:
         finally:
             for lane, (proc, task, started) in list(self.children.items()):
                 self._terminate(proc)
+                ModelArbiter(self.db).release_task(task["id"])
                 self.store.interrupted(task["id"], "Runtime shutdown interrupted worker")
                 self._heartbeat(task, "stopped")
                 del self.children[lane]
@@ -204,6 +259,21 @@ class WorkerManager:
         with self.store.transaction() as c:
             c.execute("UPDATE workers SET heartbeat=?,state=? WHERE id=?", (utc_now(), state, task["worker"]))
 
+    def _log_path(self, task_id):
+        path = self.db.path.parent / "logs" / "tasks" / f"{task_id}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _bound_log(path, limit=1048576):
+        if not path.exists() or path.stat().st_size <= limit:
+            return
+        with path.open("rb") as source:
+            source.seek(-limit, os.SEEK_END)
+            data = source.read(limit)
+        with path.open("wb") as target:
+            target.write(b"[earlier worker output truncated]\n" + data[-(limit - 35):])
+
     def tick(self):
         for lane, (proc, task, started) in list(self.children.items()):
             current = self.store.get(task["id"])
@@ -213,9 +283,15 @@ class WorkerManager:
                     self._terminate(proc)
                 else:
                     proc.wait()
+                ModelArbiter(self.db).release_task(task["id"])
                 if current["state"] in ACTIVE and not (current["type"] == "workshop" and current["state"] == "waiting"):
                     self.store.interrupted(task["id"], "Cancelled" if current["cancel_requested"] else
                                            "Task deadline exceeded" if expired else f"Worker exited ({proc.returncode})")
+                log_path = Path(current["worker_log"]) if current.get("worker_log") else self._log_path(task["id"])
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(f"\n[supervisor] exit_code={proc.returncode} cancelled={bool(current['cancel_requested'])} "
+                              f"deadline_exceeded={expired}\n")
+                self._bound_log(log_path)
                 self._heartbeat(task, "stopped")
                 del self.children[lane]
             else:
@@ -234,10 +310,15 @@ class WorkerManager:
                 try:
                     # Explicit stdin isolation is essential for a worker launched from
                     # a Windows console or from a parent with piped interactive input.
-                    proc = subprocess.Popen([sys.executable, "-B", "-m", "lilith.workers", str(self.db.path),
-                                             str(task["id"]), self.workspace, self.model],
-                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                    log_path = self._log_path(task["id"])
+                    self._bound_log(log_path)
+                    with self.store.transaction() as c:
+                        c.execute("UPDATE tasks SET worker_log=? WHERE id=?", (str(log_path), task["id"]))
+                    with log_path.open("ab") as log:
+                        proc = subprocess.Popen([sys.executable, "-B", "-u", "-m", "lilith.workers", str(self.db.path),
+                                                 str(task["id"]), self.workspace, self.model],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 except Exception as error:
                     self.store.interrupted(task["id"], str(error))
                     self._heartbeat(task, "stopped")

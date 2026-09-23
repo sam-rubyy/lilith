@@ -198,8 +198,8 @@ class LilithHome(App):
         self.query_one("#self-view", Static).update(SelfState(self.db).render())
         from lilith.tool_registry import ToolRegistry
         self.query_one("#tools-view", Static).update(json.dumps(ToolRegistry(self.db, self.store).list(), indent=2))
-        health = {"runtime": status, "schedule": settings, "model_residency": "on demand (LILITH_KEEP_ALIVE defaults to 0)",
-                  "workers": self.store.rows("SELECT * FROM workers ORDER BY heartbeat DESC LIMIT 8")}
+        from lilith.diagnostics import health_snapshot
+        health = health_snapshot(self.store, runtime=status, settings=settings)
         self.query_one("#health", Static).update(json.dumps(health, indent=2))
 
     async def submit_message(self):

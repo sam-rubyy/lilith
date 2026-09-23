@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from lilith.database import Database
 from lilith.model_gateway import OllamaGateway
+from lilith.memory import MemoryService
 from lilith.self_state import (
     DEFAULT_AFFECT,
     SelfState,
@@ -31,9 +32,13 @@ REFLECTION_PROMPT = """
 You are Lilith performing private structured reflection
 after an interaction.
 
-Analyze what actually happened.
+Analyze what actually happened. The input has three explicitly separated blocks.
 
-Do not fabricate information.
+Facts about the owner may come only from OWNER MESSAGE or other trusted evidence.
+Never attribute text from LILITH RESPONSE to the owner. Lilith's metaphors and
+generated stage directions are not factual observations. Self-beliefs must describe
+observed patterns in Lilith's behavior, not claims about the owner. Affect values are
+computational state, not feelings reported by the owner.
 
 Only create durable memories for information likely to
 matter in future conversations or decisions.
@@ -48,37 +53,6 @@ that Lilith is becoming more or less interested in a topic.
 
 Affect adjustments should be small reactions to this
 specific interaction.
-
-Return ONLY valid JSON in this exact structure:
-
-{
-  "memories": [
-    {
-      "type": "episodic",
-      "content": "memory",
-      "confidence": 0.8,
-      "importance": 0.6
-    }
-  ],
-  "self_beliefs": [
-    {
-      "belief": "belief about myself",
-      "confidence": 0.6
-    }
-  ],
-  "interests": [
-    {
-      "topic": "topic name",
-      "delta": 0.05
-    }
-  ],
-  "affect": [
-    {
-      "name": "curiosity",
-      "delta": 0.02
-    }
-  ]
-}
 
 Valid memory types are:
 
@@ -100,6 +74,39 @@ surprise
 
 Use empty arrays when no meaningful update is warranted.
 """.strip()
+
+REFLECTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["memories", "self_beliefs", "interests", "affect"],
+    "properties": {
+        "memories": {"type": "array", "maxItems": 5, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["type", "content", "evidence_source", "confidence", "importance"],
+            "properties": {
+                "type": {"type": "string", "enum": sorted(ALLOWED_MEMORY_TYPES)},
+                "content": {"type": "string", "maxLength": 500},
+                "evidence_source": {"type": "string", "enum": ["owner_message"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "importance": {"type": "number", "minimum": 0, "maximum": 1},
+            }}},
+        "self_beliefs": {"type": "array", "maxItems": 3, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["belief", "confidence"], "properties": {
+                "belief": {"type": "string", "maxLength": 300},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1}}}},
+        "interests": {"type": "array", "maxItems": 5, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["topic", "delta"], "properties": {
+                "topic": {"type": "string", "maxLength": 100},
+                "delta": {"type": "number", "minimum": -0.2, "maximum": 0.2}}}},
+        "affect": {"type": "array", "maxItems": 7, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["name", "delta"], "properties": {
+                "name": {"type": "string", "enum": sorted(DEFAULT_AFFECT)},
+                "delta": {"type": "number", "minimum": -0.1, "maximum": 0.1}}}},
+    },
+}
 
 
 def clamp(
@@ -123,11 +130,14 @@ class ReflectionEngine:
         self.database = database
         self.self_state = self_state
         self.gateway = gateway
+        self.memory = MemoryService(database)
 
     def reflect(
         self,
         user_message: str,
         assistant_response: str,
+        owner_message_id: int | None = None,
+        lilith_message_id: int | None = None,
     ) -> ReflectionOutcome:
         outcome = ReflectionOutcome()
 
@@ -142,15 +152,16 @@ class ReflectionEngine:
                     "CURRENT SELF STATE\n"
                     f"{self.self_state.prompt_context()}"
                     "\n\n"
-                    "INTERACTION\n"
-                    f"Owner: {user_message}\n"
-                    f"Lilith: {assistant_response}"
+                    "OWNER MESSAGE\n"
+                    f"{user_message}\n\n"
+                    "LILITH RESPONSE\n"
+                    f"{assistant_response}"
                 ),
             },
         ]
 
         proposal = self.gateway.chat_json(
-            messages
+            messages, schema=REFLECTION_SCHEMA
         )
 
         self._apply_memories(
@@ -184,6 +195,8 @@ class ReflectionEngine:
                 f"beliefs={outcome.beliefs_created}, "
                 f"interests={outcome.interests_changed}, "
                 f"affect={outcome.affect_changed}"
+                f", owner_message_id={owner_message_id}"
+                f", lilith_message_id={lilith_message_id}"
             ),
         )
 
@@ -199,6 +212,11 @@ class ReflectionEngine:
 
         for item in proposals[:5]:
             if not isinstance(item, dict):
+                continue
+
+            # Durable owner memories must explicitly identify owner evidence.
+            # This fail-closed check remains necessary even with model schemas.
+            if item.get("evidence_source") != "owner_message":
                 continue
 
             memory_type = str(
@@ -221,7 +239,7 @@ class ReflectionEngine:
             if len(content) > 500:
                 continue
 
-            if self.database.memory_exists(
+            if self.memory.contains(
                 content
             ):
                 continue
@@ -255,7 +273,7 @@ class ReflectionEngine:
             ):
                 continue
 
-            self.database.save_memory(
+            self.memory.remember(
                 memory_type=memory_type,
                 content=content,
                 source="lilith_reflection",

@@ -70,7 +70,7 @@ def handoff(store, parent, stage, history):
         now = utc_now()
         child = c.execute("""INSERT INTO tasks(type,priority,origin,created_at,updated_at,input,parent_task_id,
             resumable,max_attempts,timeout) VALUES (?,?,?,?,?,?,?,0,1,240)""",
-            (kind, parent["priority"], "workshop", now, now, json.dumps(payload), parent["id"])).lastrowid
+            (kind, parent["priority"], parent["origin"], now, now, json.dumps(payload), parent["id"])).lastrowid
         result = {"stage": stage, "child_task_id": child, "history": history}
         c.execute("UPDATE tasks SET state='waiting',worker=NULL,updated_at=?,result=? WHERE id=?",
                   (now, json.dumps(result), parent["id"]))

@@ -9,38 +9,9 @@ TERMINAL = {"completed", "failed", "cancelled", "needs_review"}
 KINDS = {"reflection", "journal", "executive", "capability", "research", "workshop", "workshop_stage", "tool_invocation", "conversation", "curiosity"}
 GOAL_TYPES = {"owner", "shared", "self_directed", "maintenance"}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS goals (
- id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, title TEXT NOT NULL,
- description TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', priority INTEGER NOT NULL,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, motivation TEXT NOT NULL,
- parent_goal INTEGER REFERENCES goals(id), progress REAL NOT NULL DEFAULT 0,
- next_action TEXT NOT NULL DEFAULT '', resource_budget TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tasks (
- id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
- priority INTEGER NOT NULL, origin TEXT NOT NULL, goal_id INTEGER REFERENCES goals(id),
- created_at TEXT NOT NULL, started_at TEXT, updated_at TEXT NOT NULL, finished_at TEXT,
- worker TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL,
- input TEXT NOT NULL, result TEXT, error TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
- parent_task_id INTEGER REFERENCES tasks(id), resumable INTEGER NOT NULL DEFAULT 0,
- timeout REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS task_queue ON tasks(state, priority DESC, id);
-CREATE UNIQUE INDEX IF NOT EXISTS goal_active_task ON tasks(goal_id)
- WHERE goal_id IS NOT NULL AND state NOT IN ('completed','failed','cancelled','needs_review');
-CREATE TABLE IF NOT EXISTS workers (
- id TEXT PRIMARY KEY, task_id INTEGER, heartbeat TEXT NOT NULL, state TEXT NOT NULL
-);
-"""
-
-
 class TaskStore:
     def __init__(self, database):
         self.db = database
-        with database.lock:
-            database.connection.executescript(SCHEMA)
-            database.connection.commit()
 
     @contextmanager
     def transaction(self):

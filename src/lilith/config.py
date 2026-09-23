@@ -30,6 +30,18 @@ def get_model_name() -> str:
     return os.environ.get("LILITH_MODEL", DEFAULT_MODEL)
 
 
+def get_role_model(role: str) -> str:
+    key = {
+        "conversation": "LILITH_CONVERSATION_MODEL",
+        "router": "LILITH_ROUTER_MODEL",
+        "reflection": "LILITH_REFLECTION_MODEL",
+        "reasoning": "LILITH_REASONING_MODEL",
+        "research": "LILITH_RESEARCH_MODEL",
+        "workshop": "LILITH_WORKSHOP_MODEL",
+    }.get(role)
+    return os.environ.get(key, get_model_name()) if key else get_model_name()
+
+
 def get_workspace() -> Path:
     path = Path(os.environ.get("LILITH_WORKSPACE", str(get_data_dir() / "workspace"))).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)

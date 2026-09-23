@@ -27,6 +27,12 @@ Configuration:
 | --- | --- |
 | `LILITH_DATA_DIR` | `%LOCALAPPDATA%/Lilith` (or `~/Lilith`) |
 | `LILITH_MODEL` | `huihui_ai/qwen3-abliterated:4b` |
+| `LILITH_CONVERSATION_MODEL` | `LILITH_MODEL` |
+| `LILITH_ROUTER_MODEL` | `LILITH_MODEL` |
+| `LILITH_REFLECTION_MODEL` | `LILITH_MODEL` |
+| `LILITH_REASONING_MODEL` | `LILITH_MODEL` |
+| `LILITH_RESEARCH_MODEL` | `LILITH_MODEL` |
+| `LILITH_WORKSHOP_MODEL` | `LILITH_MODEL` |
 | `LILITH_KEEP_ALIVE` | `0` (ask Ollama to unload after each request) |
 | `LILITH_OLLAMA_URL` | `http://localhost:11434` |
 | `LILITH_WORKSPACE` | `<data directory>/workspace` |
@@ -34,9 +40,10 @@ Configuration:
 | `BRAVE_SEARCH_API_KEY` | Optional; selects Brave search when set |
 | `LILITH_SEARXNG_URL` | Optional public SearXNG base URL with JSON search enabled; used when no Brave key is set |
 
-Existing SQLite data is preserved; new queue, goal, and worker tables are added on
-startup. Stop any older runtime before launching this version. Do not run multiple
-copies against one database. The new runtime and reset utility share an OS lock.
+Existing SQLite data is preserved by ordered transactional migrations recorded in
+`schema_migrations`; upgrades never require deleting the database. Every connection
+enables WAL, foreign keys, and a 30-second busy timeout. Stop any older runtime before
+launching this version. The runtime and reset utility share an OS lock.
 
 ## A persistent home
 
@@ -50,7 +57,8 @@ The **Live activity** tab shows research sources, generated implementation, test
 reports, and actual outputs. The progress bar counts completed workshop stages;
 it is not a time estimate. Research and tool execution use an indeterminate bar
 until finished. Background jobs have a separate worker lane from conversation,
-though model responses still share your Ollama server and hardware capacity.
+while a durable priority arbiter ensures owner conversation enters inference ahead
+of queued background cognition on the shared Ollama server.
 Saved tools can be reused by asking in chat. Existing open dashboards need to be
 closed and reopened to load UI changes; closing a dashboard preserves background work.
 
@@ -94,8 +102,10 @@ streaming legacy console; stop the service before using that standalone runtime.
 
 Ordinary replies queue reflection immediately. Reflection applies the existing
 memory, interest, belief, and affect updates in a separate process, then queues a
-journal entry. The input prompt returns without waiting for reflection. Concurrent
-model requests still compete for the local model server's compute capacity.
+journal entry. The input prompt returns without waiting for reflection. Inference uses
+audited, crash-recoverable priority leases: conversation and routing outrank owner
+work, reflection, background work, and curiosity. Filesystem, Git, HTTP, tests, and
+tool execution remain concurrent.
 
 ```text
 /tasks
@@ -277,7 +287,8 @@ executive planner; `/tool-run` accepts any JSON input matching the tool's schema
 
 One supervisor thread manages six bounded spawned-process lanes: conversation,
 reflection, journal, executive/capability work, research, and tool development/curiosity.
-Each worker opens its own SQLite connection.
+Each worker opens its own SQLite connection. Failed workers write bounded diagnostic
+logs under `<data>/logs/tasks/`, and task inspection includes the corresponding path.
 WAL, a busy timeout, and `BEGIN IMMEDIATE` transactions serialize queue/goal writes.
 Claims, task transitions, and associated audit events commit atomically. Worker
 heartbeats are persisted by the supervisor while each process is alive.
@@ -305,6 +316,11 @@ From this repository directory, with the environment activated:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+GitHub Actions runs this complete offline suite on Windows with Python 3.12. Linux
+runs the portable core subset without desktop or live-service acceptance tests. Both
+jobs compile the package and run Ruff's correctness-oriented static checks. Install
+the local development tools with `python -m pip install -e ".[dev]"`.
 
 Tests use temporary databases/workspaces, a fake model, and real spawned workers.
 They do not modify the owner's live memories or operate the real mouse/keyboard.

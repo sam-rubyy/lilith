@@ -3,6 +3,7 @@ import json
 import time
 
 from lilith.capabilities import CapabilityBroker, READ_ONLY, SPECS
+from lilith.memory import MemoryService
 
 
 class Executive:
@@ -50,7 +51,7 @@ class Executive:
                      '"answer":"optional reasoning","needs_review":false}. '
                      f"Use at most {steps} steps from the provided capabilities. No external network or mutations. "
                      "If the request needs unavailable capabilities, set needs_review true. Do not claim execution.",
-                     {"request": task["input"]["request"], "memories": self.db.recent_memories(limit=8),
+                     {"request": task["input"]["request"], "memories": MemoryService(self.db).retrieve(limit=8),
                       "capabilities": schema, "retained_tools": retained_tools, "workspace": str(self.workspace)})
         proposed = plan.get("steps")
         if not isinstance(proposed, list) or len(proposed) > steps:

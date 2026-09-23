@@ -13,22 +13,6 @@ from lilith.config import get_database_path, get_model_name, get_workspace
 from lilith.database import Database, utc_now
 from lilith.tasks import TaskStore
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS runtime_status (
- id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, process_created REAL NOT NULL,
- heartbeat TEXT NOT NULL, state TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0,
- model TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS inbox (
- id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- message TEXT NOT NULL, response TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued',
- task_id INTEGER, error TEXT
-);
-CREATE TABLE IF NOT EXISTS runtime_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS curiosity_sessions (
- id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, task_id INTEGER NOT NULL
-);
-"""
 DEFAULTS = {"curiosity_enabled": True, "idle_seconds": 900, "interval_seconds": 3600, "daily_sessions": 6}
 
 
@@ -36,7 +20,6 @@ class RuntimeState:
     def __init__(self, db):
         self.db, self.store = db, TaskStore(db)
         with db.lock:
-            db.connection.executescript(SCHEMA)
             for key, value in DEFAULTS.items():
                 db.connection.execute("INSERT OR IGNORE INTO runtime_settings VALUES (?,?)", (key, json.dumps(value)))
             db.connection.commit()

@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 
 
@@ -66,6 +66,32 @@ READ_ONLY = {"filesystem.read", "filesystem.list", "filesystem.search", "git.sta
 _LAUNCHED = {}
 
 
+def _audit_arguments(args):
+    """Retain useful shape without persisting credentials or large content."""
+    safe = {}
+    for key, value in args.items():
+        lowered = key.lower()
+        if key == "environment" and isinstance(value, dict):
+            safe[key] = {name: "[redacted]" for name in value}
+        elif key == "arguments" and isinstance(value, list):
+            safe[key] = ["[argument omitted]"] * len(value)
+        elif key == "url" and isinstance(value, str):
+            from urllib.parse import urlsplit, urlunsplit
+            try:
+                parts = urlsplit(value)
+                safe[key] = urlunsplit((parts.scheme, parts.hostname or "", parts.path,
+                                        "[redacted]" if parts.query else "", ""))
+            except ValueError:
+                safe[key] = "[malformed URL]"
+        elif any(marker in lowered for marker in ("password", "secret", "token", "credential", "api_key")):
+            safe[key] = "[redacted]"
+        elif key in {"content", "text"} and isinstance(value, str):
+            safe[key] = f"[content omitted: {len(value.encode('utf-8'))} bytes]"
+        else:
+            safe[key] = value
+    return safe
+
+
 class CapabilityBroker:
     def __init__(self, database, workspace, *, allowed=(), task_id=None, storage_limit=1048576):
         self.db = database
@@ -88,7 +114,7 @@ class CapabilityBroker:
 
     def invoke(self, name, args):
         # Persist intent before dispatch, including rejected requests.
-        record = {"task_id": self.task_id, "capability": name, "arguments": args}
+        record = {"task_id": self.task_id, "capability": name, "arguments": _audit_arguments(args)}
         self.db.audit("capability_requested", json.dumps(record), "capability_broker")
         try:
             if name not in SPECS or name not in self.allowed:
@@ -103,7 +129,8 @@ class CapabilityBroker:
             self.db.audit("capability_completed", json.dumps({**record, "result": result}), "capability_broker")
             return result
         except Exception as error:
-            self.db.audit("capability_failed", json.dumps({**record, "error": str(error)}), "capability_broker")
+            detail = str(error) if isinstance(error, CapabilityError) else type(error).__name__
+            self.db.audit("capability_failed", json.dumps({**record, "error": detail}), "capability_broker")
             raise
 
     def _run(self, command, arguments, cwd, timeout=30, environment=None):
@@ -117,31 +144,52 @@ class CapabilityBroker:
                 raise CapabilityError("Environment must contain string values")
             env.update(environment)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        # Drain output to disk while monitoring its size, avoiding unbounded PIPE buffers.
-        with tempfile.TemporaryFile() as out:
-            proc = subprocess.Popen([command, *arguments], cwd=self.path(cwd), env=env, stdout=out,
-                                    stderr=subprocess.STDOUT, creationflags=flags)
-            started = time.monotonic()
-            try:
-                while proc.poll() is None:
-                    if time.monotonic() - started > timeout or os.fstat(out.fileno()).st_size > 1048576:
-                        raise CapabilityError("Command time or output budget exceeded")
-                    time.sleep(0.05)
-            finally:
-                if proc.poll() is None:
-                    import psutil
-                    try:
-                        for child in psutil.Process(proc.pid).children(recursive=True):
-                            try:
-                                child.kill()
-                            except psutil.NoSuchProcess:
-                                pass
-                    except psutil.NoSuchProcess:
-                        pass
-                    proc.kill()
-                proc.wait()
-            out.seek(0)
-            return {"returncode": proc.returncode, "output": out.read(65536).decode("utf-8", errors="replace")}
+        # A dedicated reader drains the pipe but retains at most 1 MiB. This keeps a
+        # fast writer from filling disk or blocking on an undrained pipe.
+        proc = subprocess.Popen([command, *arguments], cwd=self.path(cwd), env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                creationflags=flags, bufsize=0)
+        captured = bytearray()
+        output_exceeded = threading.Event()
+
+        def drain():
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    return
+                remaining = 1048576 - len(captured)
+                if remaining > 0:
+                    captured.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    output_exceeded.set()
+
+        reader = threading.Thread(target=drain, name="capability-output-reader", daemon=True)
+        reader.start()
+        started = time.monotonic()
+        try:
+            while proc.poll() is None:
+                if time.monotonic() - started > timeout or output_exceeded.is_set():
+                    raise CapabilityError("Command time or output budget exceeded")
+                time.sleep(0.05)
+        finally:
+            if proc.poll() is None:
+                import psutil
+                try:
+                    for child in psutil.Process(proc.pid).children(recursive=True):
+                        try:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                except psutil.NoSuchProcess:
+                    pass
+                proc.kill()
+            proc.wait()
+            reader.join(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+        if output_exceeded.is_set():
+            raise CapabilityError("Command time or output budget exceeded")
+        return {"returncode": proc.returncode, "output": bytes(captured[:65536]).decode("utf-8", errors="replace")}
 
     def _dispatch(self, name, a):
         op = name.split(".")[1]
@@ -275,7 +323,8 @@ class CapabilityBroker:
                 data = io.BytesIO()
                 pyautogui.screenshot().save(data, format="PNG")
                 self._reserve(data.tell())
-                p.write_bytes(data.getvalue())
+                with p.open("xb") as output:
+                    output.write(data.getvalue())
                 return {"path": str(p), "bytes": data.tell()}
             if op == "click":
                 if not pyautogui.onScreen(a["x"], a["y"]) or a.get("button", "left") not in {"left", "right", "middle"}:

@@ -1,8 +1,21 @@
 """Translate conversation into bounded, durable background work."""
 import json
+import re
 
 from lilith.tool_registry import ToolRegistry, validate_value
 from lilith.workshop import validate_request
+
+
+def needs_routing(text):
+    """Skip the model router only for unmistakably conversational short messages."""
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized or len(normalized) > 120:
+        return True
+    if re.fullmatch(r"(?:hey|hi|hello|yo|thanks|thank you|good (?:morning|afternoon|evening))[!.?]*", normalized):
+        return False
+    if re.fullmatch(r"(?:that(?:'s| is) (?:cool|nice|great|interesting)|how are you|what do you think about this)[!.?]*", normalized):
+        return False
+    return True
 
 
 def route_request(db, store, gateway, text, check=None):

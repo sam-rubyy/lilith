@@ -2,6 +2,13 @@
 
 Includes roadmap milestones v0.0.9 and v0.1.0.
 
+- Added canonical Windows and portable Linux CI on Python 3.12, including package
+  installation, bytecode compilation, offline tests, and Ruff correctness checks.
+- Added transactional schema migrations, foreign-key enforcement, provenance-safe
+  reflection, prioritized model leases, role-specific model configuration, a chat
+  routing fast path with latency telemetry, bounded worker crash logs, outcome-based
+  curiosity reinforcement, shared memory retrieval, and expanded health diagnostics.
+
 - Streaming replies in the console and a new default Textual home with chat, task
   inspection/cancellation/priorities, journals, self-state, tools, and health.
 - Durable chat inbox and detached runtime: closing the client does not stop work.

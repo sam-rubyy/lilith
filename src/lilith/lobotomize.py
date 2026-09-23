@@ -9,6 +9,9 @@ from lilith.config import get_database_path
 
 
 TABLES_TO_CLEAR = [
+    "model_lease",
+    "model_requests",
+    "conversation_metrics",
     "curiosity_sessions",
     "runtime_settings",
     "runtime_status",
@@ -30,6 +33,14 @@ TABLES_TO_CLEAR = [
 ]
 
 
+def _connect(path):
+    connection = sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    return connection
+
+
 def create_backup(database_path: Path) -> Path:
     backup_dir = database_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -38,8 +49,8 @@ def create_backup(database_path: Path) -> Path:
 
     backup_path = backup_dir / f"pre_lobotomy_{timestamp}.db"
 
-    source = sqlite3.connect(database_path)
-    target = sqlite3.connect(backup_path)
+    source = _connect(database_path)
+    target = _connect(backup_path)
     try:
         source.backup(target)
     finally:
@@ -50,7 +61,7 @@ def create_backup(database_path: Path) -> Path:
 
 
 def clear_database(database_path: Path) -> None:
-    connection = sqlite3.connect(database_path)
+    connection = _connect(database_path)
 
     try:
         connection.execute("PRAGMA foreign_keys = OFF")

@@ -7,6 +7,7 @@ dependencies = ["psutil>=6,<8", "textual>=8.2,<9"]
 
 [project.optional-dependencies]
 desktop = ["PyAutoGUI>=0.9.54,<1", "PyGetWindow>=0.0.9,<1", "Pillow>=11,<13"]
+dev = ["ruff>=0.8,<1"]
 
 [project.scripts]
 lilith = "lilith.home:main"
@@ -21,3 +22,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Start CI with correctness checks. Broader style cleanup is intentionally deferred.
+select = ["E9", "F63", "F7", "F82"]

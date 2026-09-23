@@ -14,17 +14,6 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 
 from lilith.database import utc_now
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS research_sources (
- id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, requested_url TEXT NOT NULL,
- url TEXT NOT NULL, retrieved_at TEXT NOT NULL, title TEXT NOT NULL, content_type TEXT NOT NULL,
- sha256 TEXT NOT NULL, byte_count INTEGER NOT NULL, text TEXT NOT NULL, links TEXT NOT NULL,
- quarantine_path TEXT, kind TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS research_task ON research_sources(task_id,id);
-"""
-
-
 class ResearchError(RuntimeError):
     pass
 
@@ -158,14 +147,12 @@ class PublicHTTP:
             finally:
                 connection.close()
         raise ResearchError("Too many redirects")
+        raise ResearchError("Too many redirects")
 
 
 class Research:
     def __init__(self, database, store, gateway=None, *, http=None):
         self.db, self.store, self.gateway = database, store, gateway
-        with database.lock:
-            database.connection.executescript(SCHEMA)
-            database.connection.commit()
         self.http = http or PublicHTTP()
 
     def _save(self, task_id, requested, fetched, *, kind="page", quarantine=False):
@@ -209,8 +196,21 @@ class Research:
                 "links": links, "quarantine_path": quarantine_path}
 
     def read(self, task_id, url, *, download=False):
-        self.db.audit("research_fetch_requested", json.dumps({"task_id": task_id, "url": url, "download": download}))
-        return self._save(task_id, url, self.http.get(url), quarantine=download, kind="download" if download else "page")
+        try:
+            parts = urlsplit(url)
+            audit_url = urlunsplit((parts.scheme, parts.hostname or "", parts.path, "[redacted]" if parts.query else "", ""))
+        except (TypeError, ValueError):
+            audit_url = "[malformed URL]"
+        record = {"task_id": task_id, "url": audit_url, "download": download}
+        self.db.audit("research_fetch_requested", json.dumps(record))
+        try:
+            result = self._save(task_id, url, self.http.get(url), quarantine=download,
+                                kind="download" if download else "page")
+            self.db.audit("research_fetch_completed", json.dumps({**record, "source_id": result["source_id"]}))
+            return result
+        except Exception as error:
+            self.db.audit("research_fetch_failed", json.dumps({**record, "error_type": type(error).__name__}))
+            raise
 
     def search(self, task_id, query):
         if not isinstance(query, str) or not query.strip() or len(query) > 500:

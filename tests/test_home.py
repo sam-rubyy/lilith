@@ -89,10 +89,11 @@ class RuntimeStateTests(unittest.TestCase):
 
     def test_curiosity_records_intention_and_queues_research(self):
         from lilith.workers import execute_task
+        self.db.adjust_interest("Botany", 0.1)
         ident = self.store.enqueue("curiosity", {}, origin="self_directed")
         self.store.claim("curiosity", ["curiosity"])
-        with patch("lilith.workers.OllamaGateway") as gateway:
-            gateway.return_value.chat_json.return_value = {
+        with patch("lilith.workers.gateway") as model_gateway:
+            model_gateway.return_value.chat_json.return_value = {
                 "topic": "Botany", "question": "How do plants sense light?",
                 "motivation": "I want to understand how a plant finds the sun."}
             execute_task(self.db.path, ident, self.temp.name, "fake")
@@ -101,7 +102,23 @@ class RuntimeStateTests(unittest.TestCase):
         research = self.store.get(result["result"]["research_task_id"])
         self.assertEqual(research["type"], "research")
         self.assertEqual(research["origin"], "curiosity")
+        self.assertEqual(self.db.get_interests()[0]["fascination"], 0.6)
         self.assertTrue(self.store.rows("SELECT id FROM journal_entries WHERE title='A question for my quiet time'"))
+
+    def test_curiosity_rejects_a_recently_explored_topic(self):
+        from lilith.workers import execute_task
+        previous = self.store.enqueue("curiosity", {})
+        self.store.claim("old", ["curiosity"])
+        self.store.transition(previous, "completed", result={"topic": "Botany"})
+        ident = self.store.enqueue("curiosity", {}, origin="self_directed")
+        self.store.claim("new", ["curiosity"])
+        with patch("lilith.workers.gateway") as model_gateway:
+            model_gateway.return_value.chat_json.return_value = {
+                "topic": "  BOTANY ", "question": "How do plants sense light?",
+                "motivation": "I want to revisit it."}
+            execute_task(self.db.path, ident, self.temp.name, "fake")
+        self.assertEqual(self.store.get(ident)["state"], "needs_review")
+        self.assertFalse(self.store.rows("SELECT id FROM tasks WHERE type='research'"))
 
     def test_restart_marks_partial_reply_for_review(self):
         self.runtime.submit("Hello")

@@ -130,6 +130,17 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(transport.calls[0][1]["X-Subscription-Token"], "private-test-key")
         self.assertNotIn("private-test-key", json.dumps(self.store.rows("SELECT * FROM audit_events")))
 
+    def test_failed_fetch_audit_redacts_url_credentials_and_query(self):
+        service = Research(self.db, self.store, http=MagicMock())
+        service.http.get.side_effect = ResearchError("failed")
+        with self.assertRaises(ResearchError):
+            service.read(1, "https://owner:secret@example.com/path?token=hidden")
+        audits = json.dumps(self.store.rows("SELECT * FROM audit_events"))
+        self.assertNotIn("owner", audits)
+        self.assertNotIn("secret", audits)
+        self.assertNotIn("hidden", audits)
+        self.assertIn("research_fetch_failed", audits)
+
     def test_searx_json_search(self):
         from urllib.parse import urlencode
         url = "https://search.example.com/search?" + urlencode({"q": "docs", "format": "json"})
@@ -177,6 +188,48 @@ class ResearchTests(unittest.TestCase):
             with self.assertRaises(ResearchError):
                 PublicHTTP().get("http://example.com")
             self.assertEqual(connect.call_count, 1)
+
+    def test_redirect_limit_fails_closed(self):
+        response = MagicMock()
+        response.status = 302
+        response.getheader.side_effect = lambda key, default=None: "/again" if key == "Location" else default
+        connection = MagicMock()
+        connection.getresponse.return_value = response
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 80))]), \
+             patch("socket.create_connection"), patch("http.client.HTTPConnection", return_value=connection), \
+             self.assertRaisesRegex(ResearchError, "Too many redirects"):
+            PublicHTTP(request_limit=12).get("http://example.com")
+
+    def test_https_downgrade_and_compressed_content_are_rejected(self):
+        response = MagicMock()
+        response.status = 302
+        response.getheader.side_effect = lambda key, default=None: (
+            "http://example.com/plain" if key == "Location" else default
+        )
+        connection = MagicMock()
+        connection.getresponse.return_value = response
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]), \
+             patch("socket.create_connection"), patch("ssl.create_default_context"), \
+             patch("http.client.HTTPConnection", return_value=connection), \
+             self.assertRaisesRegex(ResearchError, "downgrade"):
+            PublicHTTP().get("https://example.com")
+
+        response.status = 200
+        response.getheader.side_effect = lambda key, default=None: (
+            "gzip" if key == "Content-Encoding" else "text/plain" if key == "Content-Type" else default
+        )
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 80))]), \
+             patch("socket.create_connection"), patch("http.client.HTTPConnection", return_value=connection), \
+             self.assertRaisesRegex(ResearchError, "Compressed"):
+            PublicHTTP().get("http://example.com")
+
+    def test_unsupported_content_requires_quarantine(self):
+        url = "https://example.com/archive.bin"
+        service = Research(self.db, self.store, http=FakeHTTP({
+            url: {"body": b"binary", "content_type": "application/octet-stream"}
+        }))
+        with self.assertRaisesRegex(ResearchError, "quarantine"):
+            service.read(1, url)
 
     def test_request_and_time_budget(self):
         with self.assertRaises(ResearchError):

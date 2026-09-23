@@ -6,84 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS audit_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    message TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    author TEXT NOT NULL,
-    title TEXT,
-    body TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    model TEXT
-);
-
-CREATE TABLE IF NOT EXISTS memories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    memory_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    source TEXT NOT NULL,
-    confidence REAL NOT NULL DEFAULT 1.0,
-    importance REAL NOT NULL DEFAULT 0.5,
-    active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS affect_state (
-    name TEXT PRIMARY KEY,
-    value REAL NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS interests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic TEXT NOT NULL UNIQUE,
-    fascination REAL NOT NULL DEFAULT 0.5,
-    first_seen TEXT NOT NULL,
-    last_seen TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS identity_state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    source TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS identity_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    key TEXT NOT NULL,
-    old_value TEXT,
-    new_value TEXT NOT NULL,
-    source TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS self_beliefs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    belief TEXT NOT NULL,
-    confidence REAL NOT NULL DEFAULT 0.5,
-    source TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
-);
-"""
+from lilith.migrations import migrate
 
 
 def utc_now() -> str:
@@ -103,8 +26,10 @@ class Database:
         )
 
         with self.lock:
-            self.connection.executescript(SCHEMA)
-            self.connection.commit()
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            self.connection.execute("PRAGMA busy_timeout = 30000")
+            migrate(self.connection, utc_now())
 
     # ---------------------------------------------------------
     # Audit
@@ -177,9 +102,9 @@ class Database:
         role: str,
         content: str,
         model: str | None = None,
-    ) -> None:
+    ) -> int:
         with self.lock:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 INSERT INTO chat_messages (
                     timestamp,
@@ -198,6 +123,7 @@ class Database:
             )
 
             self.connection.commit()
+            return int(cursor.lastrowid)
 
     def recent_messages(
         self,

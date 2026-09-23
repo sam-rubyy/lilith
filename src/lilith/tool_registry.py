@@ -8,13 +8,6 @@ import uuid
 from lilith.database import utc_now
 from lilith.tool_sandbox import Sandbox, SandboxError, bounded, formatted_source
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS tools (
- name TEXT PRIMARY KEY, version TEXT NOT NULL, purpose TEXT NOT NULL, status TEXT NOT NULL,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, task_id INTEGER NOT NULL,
- manifest TEXT NOT NULL, directory TEXT NOT NULL, hash TEXT NOT NULL, report TEXT
-);
-"""
 STATUSES = {"draft", "testing", "experimental", "approved", "deprecated", "disabled"}
 SCHEMA_KEYS = {"type", "description", "properties", "required", "additionalProperties", "items", "enum", "const",
                "minItems", "maxItems", "minLength", "maxLength", "minimum", "maximum"}
@@ -32,12 +25,17 @@ def check_schema(schema, depth=0):
     for key in {"minimum", "maximum"} & schema.keys():
         if type(schema[key]) not in {int, float}:
             raise ValueError("Invalid numeric schema limit")
+    for lower, upper in (("minItems", "maxItems"), ("minLength", "maxLength"),
+                         ("minimum", "maximum")):
+        if lower in schema and upper in schema and schema[lower] > schema[upper]:
+            raise ValueError(f"{lower} cannot exceed {upper}")
     if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
         raise ValueError("enum must be a nonempty list")
     if schema["type"] == "object":
         props = schema.get("properties", {})
         required = schema.get("required", [])
-        if not isinstance(props, dict) or not isinstance(required, list) or any(type(k) is not str or k not in props for k in required):
+        if (not isinstance(props, dict) or any(type(k) is not str for k in props)
+                or not isinstance(required, list) or any(type(k) is not str or k not in props for k in required)):
             raise ValueError("Invalid object schema")
         if type(schema.get("additionalProperties", False)) is not bool:
             raise ValueError("additionalProperties must be boolean")
@@ -85,9 +83,6 @@ class ToolRegistry:
     def __init__(self, database, store):
         self.db, self.store = database, store
         self.root = database.path.parent / "tools" / "experimental"
-        with database.lock:
-            database.connection.executescript(SCHEMA)
-            database.connection.commit()
 
     def list(self, usable=False):
         return self.store.rows("SELECT name,version,purpose,status,hash FROM tools" +

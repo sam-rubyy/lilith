@@ -58,4 +58,6 @@ def activity_text(store, task):
         lines.append("\nResult\n" + json.dumps(task["result"], ensure_ascii=False, indent=2)[:6000])
     if task["error"]:
         lines.append("\n" + task["error"])
+    if task.get("worker_log"):
+        lines.append("\nWorker log: " + task["worker_log"])
     return "\n".join(lines)

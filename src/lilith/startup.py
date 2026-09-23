@@ -26,8 +26,11 @@ def install():
               f'env("LILITH_DATA_DIR") = {quote(get_data_dir())}',
               f'env("LILITH_WORKSPACE") = {quote(get_workspace())}',
               f'env("LILITH_MODEL") = {quote(get_model_name())}']
-    if os.environ.get("LILITH_OLLAMA_URL"):
-        script.append(f'env("LILITH_OLLAMA_URL") = {quote(os.environ["LILITH_OLLAMA_URL"])}')
+    for key in ("LILITH_OLLAMA_URL", "LILITH_CONVERSATION_MODEL", "LILITH_ROUTER_MODEL",
+                "LILITH_REFLECTION_MODEL", "LILITH_REASONING_MODEL", "LILITH_RESEARCH_MODEL",
+                "LILITH_WORKSHOP_MODEL"):
+        if os.environ.get(key):
+            script.append(f'env("{key}") = {quote(os.environ[key])}')
     script.append(f"shell.Run {quote(command)}, 0, False")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\r\n".join(script) + "\r\n", encoding="utf-16")

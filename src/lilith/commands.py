@@ -161,8 +161,13 @@ def handle_command(text, store, manager):
         elif command == "/journal":
             print(json.dumps(store.rows("SELECT * FROM journal_entries ORDER BY id DESC LIMIT 10"), indent=2))
         elif command == "/health":
-            print(json.dumps({"supervisor_error": manager.error,
-                              "workers": store.rows("SELECT * FROM workers ORDER BY heartbeat DESC LIMIT 20")}, indent=2))
+            from lilith.diagnostics import health_snapshot
+            from lilith.service import RuntimeState
+            state = RuntimeState(store.db)
+            print(json.dumps(health_snapshot(
+                store, runtime=state.status(), settings=state.settings(),
+                supervisor_error=getattr(manager, "error", None),
+            ), indent=2))
     except (ValueError, TypeError, KeyError, OSError) as error:
         print(f"Command error: {error}")
     return True

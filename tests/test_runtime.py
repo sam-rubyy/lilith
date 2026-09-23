@@ -17,10 +17,11 @@ from unittest.mock import patch
 from lilith.capabilities import CapabilityBroker, CapabilityError, READ_ONLY, SPECS
 from lilith.commands import handle_command
 from lilith.database import Database
+from lilith.diagnostics import health_snapshot
 from lilith.executive import Executive
 from lilith.lobotomize import create_backup, clear_database
 from lilith.tasks import TaskStore
-from lilith.workers import RuntimeLock, WorkerManager, execute_task
+from lilith.workers import RuntimeLock, WorkerManager, execute_task, reinforce_curiosity_outcome
 
 
 class FakeGateway:
@@ -28,7 +29,7 @@ class FakeGateway:
         self.replies = iter(replies)
         self.calls = 0
 
-    def chat_json(self, messages):
+    def chat_json(self, messages, schema=None):
         self.calls += 1
         return next(self.replies)
 
@@ -116,6 +117,21 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.store.rows("SELECT id FROM audit_events WHERE event_type='capability_failed'")), 4)
         self.assertFalse((self.root / "outside.txt").exists())
 
+    def test_capability_audit_redacts_environment_and_content(self):
+        broker = CapabilityBroker(self.db, self.workspace, allowed={"terminal.run", "filesystem.write"})
+        broker.invoke("filesystem.write", {"path": "note.txt", "content": "private body"})
+        broker.invoke("terminal.run", {
+            "command": sys.executable, "arguments": ["-c", "print('ok')"],
+            "working_directory": ".", "timeout": 5,
+            "environment": {"API_TOKEN": "do-not-store"}, "expected_effect": "print",
+        })
+        messages = "\n".join(row["message"] for row in self.store.rows(
+            "SELECT message FROM audit_events WHERE event_type LIKE 'capability_%'"
+        ))
+        self.assertNotIn("do-not-store", messages)
+        self.assertNotIn("private body", messages)
+        self.assertIn("[redacted]", messages)
+
     def test_storage_limit_and_no_overwrite_copy(self):
         b = self.broker(storage_limit=4)
         with self.assertRaises(CapabilityError):
@@ -127,12 +143,33 @@ class RuntimeTests(unittest.TestCase):
             b.invoke("filesystem.copy", {"source": "one", "destination": "two"})
         self.assertEqual((self.workspace / "two").read_text(), "2")
 
+    def test_symlink_escape_is_rejected(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret")
+        link = self.workspace / "outside-link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        with self.assertRaises(CapabilityError):
+            self.broker().invoke("filesystem.read", {"path": "outside-link/secret.txt"})
+
     def test_terminal_literal_arguments_and_exit(self):
         result = self.broker().invoke("terminal.run", {"command": sys.executable,
             "arguments": ["-c", "import sys; print(sys.argv[1]); sys.exit(3)", "hello; echo injected"],
             "working_directory": ".", "timeout": 5, "environment": {}, "expected_effect": "Print literal argument"})
         self.assertEqual(result["returncode"], 3)
         self.assertEqual(result["output"].strip(), "hello; echo injected")
+
+    def test_terminal_output_budget_kills_fast_writer(self):
+        with self.assertRaisesRegex(CapabilityError, "output budget"):
+            self.broker().invoke("terminal.run", {
+                "command": sys.executable,
+                "arguments": ["-c", "import sys; sys.stdout.write('x' * 2000000)"],
+                "working_directory": ".", "timeout": 10, "environment": {},
+                "expected_effect": "Exercise output bound",
+            })
 
     def test_git_status(self):
         subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
@@ -183,7 +220,7 @@ class RuntimeTests(unittest.TestCase):
     def test_reflection_worker_applies_and_queues_journal(self):
         ident = self.store.enqueue("reflection", {"user_message": "hi", "assistant_response": "hello"})
         self.store.claim("reflection", ["reflection"])
-        with patch("lilith.workers.OllamaGateway", return_value=FakeGateway([{}])):
+        with patch("lilith.workers.gateway", return_value=FakeGateway([{}])):
             execute_task(str(self.db.path), ident, str(self.workspace), "test")
         self.assertEqual(self.store.get(ident)["state"], "completed")
         self.assertEqual(len(self.store.rows("SELECT * FROM tasks WHERE type='journal'")), 1)
@@ -201,6 +238,39 @@ class RuntimeTests(unittest.TestCase):
             manager.close()
         self.assertTrue(self.store.rows("SELECT * FROM workers"))
         self.assertIsNone(manager.error)
+
+    def test_worker_failure_keeps_bounded_diagnostic_log(self):
+        manager = WorkerManager(self.db, self.workspace, "unused", poll_interval=0.05)
+        ident = self.store.enqueue("reflection", {})
+        manager.start()
+        try:
+            self.wait_terminal(ident)
+        finally:
+            manager.close()
+        task = self.store.get(ident)
+        self.assertEqual(task["state"], "needs_review")
+        log_path = Path(task["worker_log"])
+        self.assertTrue(log_path.is_file())
+        log = log_path.read_text(encoding="utf-8")
+        self.assertIn("Traceback", log)
+        self.assertIn("ReflectionEngine.reflect", log)
+        self.assertLessEqual(log_path.stat().st_size, 1048576)
+
+    def test_curiosity_reinforcement_requires_research_outcome(self):
+        parent_id = self.store.enqueue("curiosity", {})
+        self.store.claim("curiosity", ["curiosity"])
+        self.store.transition(parent_id, "completed", result={"topic": "Botany"})
+        research_id = self.store.enqueue(
+            "research", {"query": "plants"}, origin="curiosity", parent_task_id=parent_id
+        )
+        research = self.store.get(research_id)
+        self.assertEqual(self.db.get_interests(), [])
+        self.assertFalse(reinforce_curiosity_outcome(self.db, self.store, research, {"claims": []}))
+        self.assertEqual(self.db.get_interests(), [])
+        self.assertTrue(reinforce_curiosity_outcome(
+            self.db, self.store, research, {"claims": [{"text": "Plants respond to light."}]}
+        ))
+        self.assertEqual(self.db.get_interests()[0]["topic"], "Botany")
 
     def wait_terminal(self, ident, timeout=10):
         deadline = time.monotonic() + timeout
@@ -268,6 +338,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.store.rows("SELECT * FROM tasks")), 1)
         self.assertEqual(len(self.store.rows("SELECT * FROM goals")), 1)
 
+    def test_health_snapshot_exposes_stabilization_state(self):
+        snapshot = health_snapshot(
+            self.store, runtime={"state": "test"}, settings={"curiosity_enabled": False}
+        )
+        for key in ("service", "model", "model_queue", "active_model_role", "worker_lanes",
+                    "current_tasks", "stale_workers", "database_schema_version", "wal_status",
+                    "workspace", "counts", "recent_worker_failures", "curiosity_enabled",
+                    "last_curiosity_session", "conversation_performance"):
+            self.assertIn(key, snapshot)
+        self.assertEqual(snapshot["wal_status"], "wal")
+
     def test_process_inspect_and_stop(self):
         result = self.broker().invoke("process.start", {"command": sys.executable,
             "arguments": ["-c", "import time; time.sleep(30)"], "working_directory": ".",
@@ -324,7 +405,9 @@ class RuntimeTests(unittest.TestCase):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if isinstance(data.get("format"), dict) and "action" in data["format"].get("properties", {}):
                     content = json.dumps({"action": "chat"})
-                elif data.get("format") == "json":
+                elif (data.get("format") == "json" or
+                      (isinstance(data.get("format"), dict) and
+                       "memories" in data["format"].get("properties", {}))):
                     entered.set()
                     release.wait(10)
                     content = "{}"
@@ -352,7 +435,7 @@ class RuntimeTests(unittest.TestCase):
         reader.start()
 
         def await_line(fragment):
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 20
             captured = []
             while time.monotonic() < deadline:
                 try:

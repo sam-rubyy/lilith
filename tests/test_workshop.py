@@ -67,6 +67,11 @@ class SandboxTests(unittest.TestCase):
         with self.assertRaisesRegex(SandboxError, "budget"):
             Sandbox(operations=10).run("def run(data):\n for i in range(100):\n  x = i + 1\n return x", {})
 
+    def test_time_budget(self):
+        with patch("lilith.tool_sandbox.time.monotonic", side_effect=[0, 3]), \
+             self.assertRaisesRegex(SandboxError, "budget"):
+            Sandbox(seconds=2).run("def run(data):\n return data", {})
+
     def test_memory_amplification_blocked(self):
         for expression in ("'x' * 100000000", "range(100000000)", "replace('x' * 1000, 'x', 'y' * 1000)"):
             with self.subTest(expression=expression), self.assertRaises(SandboxError):
@@ -88,6 +93,10 @@ class SandboxTests(unittest.TestCase):
     def test_schema_subset_no_remote_refs(self):
         with self.assertRaises(ValueError):
             check_schema({"type": "object", "$ref": "https://example.com/schema"})
+        with self.assertRaises(ValueError):
+            check_schema({"type": "string", "minLength": 5, "maxLength": 2})
+        with self.assertRaises(ValueError):
+            check_schema({"type": "object", "properties": {1: {"type": "string"}}})
         with self.assertRaises(SandboxError):
             validate_value(True, {"type": "integer"})
         with self.assertRaises(SandboxError):
@@ -176,7 +185,7 @@ class WorkshopTests(unittest.TestCase):
         if research:
             self.store.transition(child_id, "completed", result={"claims": [{"text": "Normalize text", "source_ids": [1]}], "citations": []})
         else:
-            with patch("lilith.workers.OllamaGateway", return_value=FakeGateway(reply)):
+            with patch("lilith.workers.gateway", return_value=FakeGateway(reply)):
                 execute_task(str(self.db.path), child_id, str(self.root), "fake")
         reconcile_workshops(self.store)
         return self.store.get(child_id)

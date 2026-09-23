@@ -71,6 +71,25 @@ class IntentTests(unittest.TestCase):
             Conversation(self.db, Gateway()).reply("build it", lambda _: None, check=check)
         self.assertFalse(self.store.rows("SELECT id FROM tasks"))
 
+    def test_obvious_conversation_bypasses_router_and_records_latency(self):
+        gateway = Gateway("build")
+        response, _ = Conversation(self.db, gateway).reply("how are you?", lambda _: None)
+        self.assertEqual(response, "Let’s talk.")
+        self.assertFalse(hasattr(gateway, "messages"))
+        metric = self.store.rows("SELECT * FROM conversation_metrics")[0]
+        self.assertEqual(metric["router_used"], 0)
+        self.assertEqual(metric["router_duration"], 0.0)
+        self.assertIsNotNone(metric["time_to_first_token"])
+        self.assertGreaterEqual(metric["total_conversation_duration"], metric["time_to_first_token"])
+
+    def test_uncertain_message_still_uses_router(self):
+        gateway = Gateway("chat")
+        Conversation(self.db, gateway).reply("Could we revisit the parser idea?", lambda _: None)
+        self.assertTrue(hasattr(gateway, "messages"))
+        self.assertEqual(self.store.rows(
+            "SELECT router_used FROM conversation_metrics"
+        )[0]["router_used"], 1)
+
     def test_progress_tracks_actual_completed_stages_and_failure(self):
         ident = self.store.enqueue("workshop", {"request": "normalize tags", "data": {}})
         task = self.store.claim("parent", ["workshop"])
