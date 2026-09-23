@@ -82,6 +82,22 @@ class IntentTests(unittest.TestCase):
         self.assertIsNotNone(metric["time_to_first_token"])
         self.assertGreaterEqual(metric["total_conversation_duration"], metric["time_to_first_token"])
 
+    def test_comment_about_existing_research_does_not_start_research(self):
+        gateway = Gateway("research", request="animal communication")
+        response, _ = Conversation(self.db, gateway).reply(
+            "so i see you were researching animal communication styles?", lambda _: None)
+        self.assertEqual(response, "Let’s talk.")
+        self.assertFalse(hasattr(gateway, "messages"))
+        self.assertFalse(self.store.rows("SELECT id FROM tasks WHERE type='research'"))
+
+    def test_explicit_research_request_still_uses_router(self):
+        gateway = Gateway("research", request="animal communication styles")
+        response, _ = Conversation(self.db, gateway).reply(
+            "please research animal communication styles", lambda _: None)
+        self.assertTrue(hasattr(gateway, "messages"))
+        self.assertIn("Research #", response)
+        self.assertEqual(len(self.store.rows("SELECT id FROM tasks WHERE type='research'")), 1)
+
     def test_uncertain_message_still_uses_router(self):
         gateway = Gateway("chat")
         Conversation(self.db, gateway).reply("Could we revisit the parser idea?", lambda _: None)
