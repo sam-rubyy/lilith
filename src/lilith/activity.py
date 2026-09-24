@@ -34,7 +34,7 @@ def work_progress(store, task):
 def activity_text(store, task):
     percent, label = work_progress(store, task)
     lines = [f"#{task['id']} · {task['type']} · {label}",
-             task["input"].get("request", task["input"].get("query", task["input"].get("name", "")))]
+             task["input"].get("request", task["input"].get("query", task["input"].get("name", task["input"].get("capability", ""))))]
     if percent is not None:
         lines.append(f"{percent}% of stages complete")
     children = store.rows("SELECT id FROM tasks WHERE parent_task_id=? AND type != 'journal' ORDER BY id", (task["id"],))

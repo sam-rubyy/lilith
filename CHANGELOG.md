@@ -1,3 +1,27 @@
+# Unreleased — stabilization
+
+- Enabled owner-authorized unrestricted shell permissions by default for this
+  checkout (`LILITH_ALLOW_SHELL=0` revokes them). Chat and executive tasks can queue
+  `shell.run`; generated tools can declare `shell` and use `shell(command)`.
+- Generated shell tests use fixtures; the canary avoids real effects and final
+  execution runs once. Optional research can be skipped and failing generated tests
+  feed the existing correction attempt before artifacts are saved.
+- Added migration 6 for worker PID/creation-time identity, a startup handshake,
+  matching-orphan cleanup before recovery, continuously bounded worker logs, and
+  shared diagnostic redaction. Fixed a concurrent first-open WAL initialization race.
+
+- Added an executable Linux launcher and setup instructions.
+- Added migration 5 linking reflection memories to saved owner/assistant messages.
+  Require exact owner excerpts, validate source roles/text, and reject non-finite
+  reflection updates. Existing memories are preserved without invented provenance.
+- Clear orphaned model requests at runtime restart and reserve inference for owner
+  inbox messages before dispatch. Curiosity research retains curiosity priority.
+- Make interruption/retry decisions transactional, enforce read-only replay
+  eligibility at enqueue and recovery, and reject late work for canceled parents.
+- Audit malformed capability calls and stop reporting stopped workers as stale.
+- Remove the offline desktop test's undeclared Pillow dependency, isolate startup
+  test configuration, and run the complete offline suite in both CI jobs.
+
 # v0.1.0 — 2026-09-23
 
 Includes roadmap milestones v0.0.9 and v0.1.0.

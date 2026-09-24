@@ -7,11 +7,61 @@ import uuid
 
 from lilith.database import utc_now
 from lilith.tool_sandbox import Sandbox, SandboxError, bounded, formatted_source
+from lilith.capabilities import shell_enabled
 
 STATUSES = {"draft", "testing", "experimental", "approved", "deprecated", "disabled"}
 SCHEMA_KEYS = {"type", "description", "properties", "required", "additionalProperties", "items", "enum", "const",
                "minItems", "maxItems", "minLength", "maxLength", "minimum", "maximum"}
 TYPES = {"object": dict, "array": list, "string": str, "integer": int, "number": (int, float), "boolean": bool, "null": type(None)}
+
+
+def check_permissions(permissions):
+    if permissions == []:
+        return
+    if permissions != ["shell"] or not shell_enabled():
+        raise ValueError("Tool permissions exceed the owner's configured grants")
+
+
+class ShellFixtureError(RuntimeError):
+    pass
+
+
+def case_runner(case):
+    """Tests receive deterministic shell fixtures and never a host shell."""
+    calls = case.get("shell_calls", [])
+    if not isinstance(calls, list):
+        raise ShellFixtureError("shell_calls must be an array")
+    pending = iter(calls)
+    def shell(command):
+        fixture = next(pending, None)
+        if not isinstance(fixture, dict) or fixture.get("command") != command:
+            raise ShellFixtureError("Shell call did not match the next test fixture")
+        result = fixture.get("result")
+        if (not isinstance(result, dict) or type(result.get("returncode")) is not int
+                or not isinstance(result.get("output"), str)):
+            raise ShellFixtureError("Shell fixture needs integer returncode and string output")
+        return result
+    def finish():
+        if next(pending, None) is not None:
+            raise ShellFixtureError("Test did not consume all shell fixtures")
+    return shell, finish
+
+
+def run_case(source, design, case):
+    shell, finish = case_runner(case)
+    result = None
+    error = None
+    try:
+        bounded(case["input"])
+        validate_value(case["input"], design["inputs"])
+        result = Sandbox(shell=shell if design.get("permissions") == ["shell"] else None).run(source, case["input"])
+        validate_value(result, design["outputs"])
+        passed = "expected" in case and result == case["expected"]
+    except SandboxError as exc:
+        error = str(exc)
+        passed = case.get("expect_error") is True
+    finish()
+    return {"passed": passed, "error": error} if error else {"passed": passed, "result": result}
 
 
 def check_schema(schema, depth=0):
@@ -84,17 +134,23 @@ class ToolRegistry:
         self.db, self.store = database, store
         self.root = database.path.parent / "tools" / "experimental"
 
-    def list(self, usable=False):
-        return self.store.rows("SELECT name,version,purpose,status,hash FROM tools" +
+    def list(self, usable=False, read_only=False):
+        rows = self.store.rows("SELECT name,version,purpose,status,hash,manifest FROM tools" +
                                (" WHERE status IN ('experimental','approved')" if usable else "") + " ORDER BY name")
+        result = []
+        for row in rows:
+            row["permissions"] = json.loads(row.pop("manifest")).get("permissions", [])
+            if row["permissions"] and (read_only or (usable and not shell_enabled())):
+                continue
+            result.append(row)
+        return result
 
     def create(self, task_id, design, implementation):
         slug = design.get("name", "")
         if not isinstance(slug, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,39}", slug):
             raise ValueError("Tool name must be a short lowercase slug")
         name = f"{slug}-{task_id}-{uuid.uuid4().hex[:6]}"
-        if design.get("permissions") != []:
-            raise ValueError("Generated tools cannot request host capabilities in v0.1.0")
+        check_permissions(design.get("permissions"))
         for key in ("inputs", "outputs"):
             check_schema(design[key])
         purpose = design.get("purpose")
@@ -119,9 +175,11 @@ class ToolRegistry:
         now = utc_now()
         manifest = {"name": name, "version": "0.1.0", "purpose": purpose, "author": "Lilith",
                     "created_at": now, "inputs": design["inputs"], "outputs": design["outputs"],
-                    "permissions": [], "resource_limits": {"operations": 20000, "json_bytes": 65536,
-                    "network_bytes": 0, "host_writes": 0}, "timeout": 2,
-                    "rollback_strategy": "Pure transformation; disable registry entry to withdraw capability",
+                    "permissions": design["permissions"], "resource_limits": {"operations": 20000, "json_bytes": 65536,
+                    "network_bytes": None if design["permissions"] else 0,
+                    "host_writes": None if design["permissions"] else 0}, "timeout": 120 if design["permissions"] else 2,
+                    "rollback_strategy": "Disable registry entry; shell side effects require manual review" if design["permissions"] else
+                    "Pure transformation; disable registry entry to withdraw capability",
                     "runtime": "lilith-json-python-v1", "status": "draft"}
         digest = artifact_hash(manifest, source, tests, readme)
         manifest["hash"] = digest
@@ -176,7 +234,7 @@ class ToolRegistry:
                       (status, utc_now(), json.dumps(manifest), json.dumps(report) if report is not None else None, name))
             self.store._event(c, "tool_status", {"name": name, "status": status})
 
-    def invoke(self, name, data, *, task_id, testing=False):
+    def invoke(self, name, data, *, task_id, testing=False, allow_shell=False, workspace=None):
         self.db.audit("tool_invocation_requested", json.dumps({"task_id": task_id, "name": name, "testing": testing}))
         try:
             row, manifest, source, _ = self.load(name)
@@ -185,7 +243,16 @@ class ToolRegistry:
                 raise ValueError("Tool is not eligible for invocation")
             bounded(data)
             validate_value(data, manifest["inputs"])
-            result = Sandbox().run(source, data)
+            shell = None
+            if manifest.get("permissions"):
+                if testing or not allow_shell or not shell_enabled():
+                    raise ValueError("Host shell invocation requires the owner's shell grant")
+                check_permissions(manifest["permissions"])
+                from lilith.capabilities import CapabilityBroker
+                from lilith.config import get_workspace
+                broker = CapabilityBroker(self.db, workspace or get_workspace(), allowed={"shell.run"}, task_id=task_id)
+                shell = lambda command: broker.invoke("shell.run", {"command": command})
+            result = Sandbox(shell=shell).run(source, data)
             validate_value(result, manifest["outputs"])
             self.db.audit("tool_invocation_completed", json.dumps({"task_id": task_id, "name": name,
                           "hash": row["hash"], "result": result}))
@@ -196,18 +263,17 @@ class ToolRegistry:
 
     def test(self, name, *, task_id):
         self.status(name, "testing")
-        _, _, source, tests = self.load(name)
+        _, manifest, source, tests = self.load(name)
         results = []
         for i, case in enumerate(tests):
             try:
-                result = self.invoke(name, case["input"], task_id=task_id, testing=True)
-                passed = "expected" in case and result == case["expected"]
-                results.append({"case": i, "passed": passed, "result": result})
-            except SandboxError as error:
-                results.append({"case": i, "passed": case.get("expect_error") is True, "error": str(error)})
+                results.append({"case": i, **run_case(source, manifest, case)})
+            except ShellFixtureError as error:
+                results.append({"case": i, "passed": False, "error": str(error)})
         report = {"passed": all(r["passed"] for r in results), "cases": results,
                   "format_check": source == formatted_source(source), "syntax_and_capability_check": True,
-                  "input_output_type_checks": True, "sandbox": "lilith-json-python-v1"}
+                  "input_output_type_checks": True, "sandbox": "lilith-json-python-v1",
+                  "shell_calls_mocked": bool(manifest["permissions"])}
         with self.store.transaction() as c:
             c.execute("UPDATE tools SET report=?,updated_at=? WHERE name=?", (json.dumps(report), utc_now(), name))
         self.db.audit("tool_tests_completed", json.dumps({"task_id": task_id, "name": name, "report": report}))

@@ -2,9 +2,26 @@
 
 Local persistent chat with background reflection, durable goals, bounded executive
 cognition, an audited local capability broker, public-web research, and a persistent
-tool workshop. Implements roadmap milestones v0.0.6–v0.1.0. Generated tools currently
-transform bounded JSON data; arbitrary Python packages and tools with host permissions
-are outside this release's workshop sandbox.
+tool workshop. Implements roadmap milestones v0.0.6–v0.1.0. This checkout includes
+owner-authorized full shell access for normal requests, executive tasks, and
+generated tools.
+
+## Run on Linux
+
+Install Python 3.12 with virtual environment support, then run these commands from
+this repository directory:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e .
+./launch-lilith.sh
+```
+
+The executable launcher uses this repository's `.venv` and can also be invoked by
+its full path from another directory. Alternatively, activate the environment with
+`source .venv/bin/activate` and run `lilith`.
+Ollama must be running with the configured model installed for conversation.
+Closing the dashboard leaves the runtime running; use `/shutdown` to stop it.
 
 ## Run on Windows
 
@@ -36,6 +53,7 @@ Configuration:
 | `LILITH_KEEP_ALIVE` | `0` (ask Ollama to unload after each request) |
 | `LILITH_OLLAMA_URL` | `http://localhost:11434` |
 | `LILITH_WORKSPACE` | `<data directory>/workspace` |
+| `LILITH_ALLOW_SHELL` | `1`; set `0` and restart to revoke shell access |
 | `LILITH_SEARCH_PROVIDER` | `mwmbl`; optional `duckduckgo` HTML adapter |
 | `BRAVE_SEARCH_API_KEY` | Optional; selects Brave search when set |
 | `LILITH_SEARXNG_URL` | Optional public SearXNG base URL with JSON search enabled; used when no Brave key is set |
@@ -44,6 +62,14 @@ Existing SQLite data is preserved by ordered transactional migrations recorded i
 `schema_migrations`; upgrades never require deleting the database. Every connection
 enables WAL, foreign keys, and a 30-second busy timeout. Stop any older runtime before
 launching this version. The runtime and reset utility share an OS lock.
+
+Shell commands run through Bash on Linux or `cmd.exe` on Windows under the owner's
+account. There is no command allowlist or filesystem/network confinement; the
+workspace is just the starting directory. Normal requests can queue shell work,
+and `/run shell.run {"command":"..."}` dispatches a command explicitly. Results
+appear in Live activity and Tasks. Shell calls retain a 120-second command timeout,
+a 1 MiB capture budget (64 KiB returned), task cancellation, and no automatic replay.
+These lifecycle limits do not restrict which commands or paths are accessible.
 
 ## A persistent home
 
@@ -107,6 +133,15 @@ audited, crash-recoverable priority leases: conversation and routing outrank own
 work, reflection, background work, and curiosity. Filesystem, Git, HTTP, tests, and
 tool execution remain concurrent.
 
+New reflection memories retain exact excerpts from the saved owner message, with
+foreign-key links to the owner and assistant message IDs. The runtime checks the
+saved roles and text; a model cannot relabel its own response as owner evidence.
+These excerpts are owner statements, not independently verified facts. Models must
+preserve qualifications and context; excerpt membership alone cannot verify meaning.
+Existing memories remain intact with unknown provenance represented by null IDs.
+Legacy queued reflections without an owner message ID skip memory creation while
+still allowing the other reflection updates. Non-finite numeric updates are rejected.
+
 ```text
 /tasks
 /task 12
@@ -132,10 +167,11 @@ come from owner console commands; spontaneous goal formation is a later mileston
 
 Executive cycles recall memories, create a plan, independently review/revise it,
 authorize each step, execute, verify evidence, and queue a journal. Defaults are six
-steps, three model calls, 180 seconds, zero external network bytes, and a 1 MiB storage
-budget. Only read-only local capabilities and retained pure JSON tools are available to model-generated plans.
-Unavailable actions are reported for review. These cycles cannot authorize themselves
-to modify files, launch programs, or operate the desktop.
+steps, three model calls, and 180 seconds. Plans receive read-only capabilities plus
+`shell.run` when the owner grant is enabled, including shell-capable retained tools.
+Shell work has the owner's OS permissions; legacy network/storage budget fields do
+not provide confinement for shell commands. Disabling the shell grant restores the
+read-only model capability catalog. Unavailable actions are reported for review.
 
 ## Request local actions
 
@@ -236,14 +272,16 @@ Submit an owner request with concrete JSON input and, preferably, an expected re
 /tool-state <generated-name> disabled
 ```
 
-`urls` and `research_query` are optional. With no URLs, a generic technical query is
-generated for public search. The workflow first checks existing read-only capabilities
-and registered tools. Exact matches are reused; otherwise it creates separate task
+`urls` and `research_query` are optional. The model can skip research with an empty
+query when no external reference is needed; supplied URLs or a query still request
+research. The workflow first checks granted capabilities and registered tools.
+Requests to build reusable tools are routed to generation or tool reuse. It creates separate task
 records for research, design, implementation, tests, capability review, canary,
 execution, and verification. `/task` on the parent shows its current child and stage
 history. Cancel the parent to cancel active/queued children. A workshop is limited
 to nine stages and 30 minutes. Each workshop model role gets at most one correction
-attempt for malformed output; corrections and proposals are retained for inspection.
+attempt for malformed output or failed generated tests; corrections and proposals
+are retained for inspection.
 
 Generated artifacts live at `<data directory>/tools/experimental/<generated-name>/`:
 
@@ -262,20 +300,25 @@ failure cases. Only passing, reviewed tools become experimental. Canary and fina
 verification failures disable newly created tools. An owner's `expected` result is
 checked independently of the model's judgment.
 
-The sandbox interprets a small Python AST subset; it never executes generated code
-with Python `exec`/`eval`. Tools get JSON input and return JSON output. They cannot
-import libraries, access attributes, call arbitrary functions, open files, use the
-network, start processes, or invoke other capabilities. Loops and operations are
-metered. Per invocation: 20,000 operations, 2 seconds, 64 KiB JSON, 1,000 items per
-collection, nesting depth 20, and 256-bit integers. Supported helpers and syntax are
-documented in `src/lilith/tool_sandbox.py` (`CONTRACT`). This is a restricted language
-runtime, not support for unrestricted third-party Python or an OS container.
+Generated tools keep the Python AST interpreter and JSON input/output interface.
+Pure tools use `permissions: []`. Tools with `permissions: ["shell"]` can call
+`shell(command)`, which returns `{"returncode": ..., "output": ...}`. This helper
+can run arbitrary programs, scripts, imports via an external Python process, and
+filesystem/network operations under the owner's account. The runtime checks the
+owner's grant at invocation and on each shell call; a model cannot restore a
+revoked grant.
+
+AST computation remains metered: 20,000 operations, 2 seconds excluding shell wait,
+64 KiB JSON, 1,000 items per collection, nesting depth 20, and 256-bit integers.
+Generated tests use ordered `shell_calls` fixtures and never execute real commands.
+For shell tools the canary validates inputs and integrity; only the execution stage
+performs the real action, avoiding duplicate side effects. This is host execution,
+not an OS sandbox. Contracts are in `src/lilith/tool_sandbox.py`.
 
 The schema subset supports explicit types, object properties/required keys, arrays,
 enums/constants, numeric bounds, and length limits. Remote references and regex
-schemas are not accepted. For host work such as extracting EXIF from arbitrary files
-or installing packages, use existing owner-authorized capabilities; generating new
-host-access tools needs a future sandbox backend.
+schemas are not accepted. Shell-capable tools can use host programs for tasks such
+as file processing or package installation.
 
 Source, manifest, README, and tests are hash-checked before every invocation. A
 modified artifact or mismatch with the database fails closed. The registry survives
@@ -300,6 +343,12 @@ have produced side effects becomes `needs_review`. Reflection and journaling are
 conservatively non-resumable because they update persistent state. Inspect the audit
 and result before submitting replacement work; no blind replay of interrupted writes.
 
+Retry eligibility is checked against the capability broker's read-only catalog at
+enqueue and recovery, including legacy tasks with incorrect resumable flags.
+Restart cleanup clears abandoned model requests and leases while holding the
+runtime lock. Owner messages block background inference as soon as they reach the
+inbox, before dispatch creates a conversation task.
+
 Waiting workshop parents persist their child/checkpoint atomically and can continue
 after restart when the child was safely queued or completed. Interrupted active
 stages require review. A failed stage prevents subsequent stages from starting.
@@ -317,13 +366,17 @@ From this repository directory, with the environment activated:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs this complete offline suite on Windows with Python 3.12. Linux
-runs the portable core subset without desktop or live-service acceptance tests. Both
+GitHub Actions is configured to run this complete offline suite on Windows and Linux
+with Python 3.12. Desktop adapters are mocked without optional desktop dependencies;
+service tests use temporary state and local fake model servers. Both
 jobs compile the package and run Ruff's correctness-oriented static checks. Install
 the local development tools with `python -m pip install -e ".[dev]"`.
 
 Tests use temporary databases/workspaces, a fake model, and real spawned workers.
 They do not modify the owner's live memories or operate the real mouse/keyboard.
+
+See [the stabilization report](STABILIZATION.md) for the baseline failure, fixes,
+regression coverage, and remaining work from `LILITH_ROADMAP.md`.
 
 An explicit live acceptance run uses temporary state, public documentation, the
 configured search provider, and the configured Ollama model:

@@ -107,6 +107,41 @@ class ModelArbitrationTests(unittest.TestCase):
             self.assertEqual(gateway(self.db, ModelRole.CONVERSATION).model_name, "base")
             self.assertEqual(gateway(self.db, ModelRole.REFLECTION).model_name, "reflect")
 
+    def test_restart_clears_orphaned_waiters_and_active_lease(self):
+        arbiter = ModelArbiter(self.db)
+        active = arbiter.acquire(ModelRole.BACKGROUND)
+        with self.db.lock:
+            self.db.connection.execute("""INSERT INTO model_requests
+                (id,role,priority,created_at,state) VALUES ('orphan','conversation',100,?,'waiting')""",
+                (utc_now(),))
+            self.db.connection.commit()
+        arbiter.recover()
+        rows = TaskStore(self.db).rows("SELECT state FROM model_requests")
+        self.assertEqual([row["state"] for row in rows], ["cancelled", "cancelled"])
+        self.assertIsNone(self.db.connection.execute("SELECT * FROM model_lease").fetchone())
+        request = arbiter.acquire(ModelRole.MAINTENANCE)
+        arbiter.release(request)
+        self.assertEqual(len(TaskStore(self.db).rows(
+            "SELECT id FROM audit_events WHERE event_type='model_lease_released'"
+        )), 3)
+
+    def test_undispatched_owner_inbox_blocks_background_inference(self):
+        from lilith.service import RuntimeState
+        state = RuntimeState(self.db)
+        state.submit("Hi")
+        arbiter = ModelArbiter(self.db, poll_interval=0.005)
+        checks = 0
+        def cancel_wait():
+            nonlocal checks
+            checks += 1
+            if checks == 3:
+                raise RuntimeError("cancel wait")
+        with self.assertRaisesRegex(RuntimeError, "cancel wait"):
+            arbiter.acquire(ModelRole.CURIOSITY, check=cancel_wait)
+        # The owner itself must still be able to acquire the model.
+        request = arbiter.acquire(ModelRole.CONVERSATION)
+        arbiter.release(request)
+
     def test_supervisor_task_cancellation_releases_active_lease(self):
         arbiter = ModelArbiter(self.db)
         request = arbiter.acquire(ModelRole.BACKGROUND, task_id=42)

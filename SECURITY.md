@@ -13,6 +13,14 @@ and generated tool source as untrusted data. Authority comes from runtime code a
 explicit owner actions. Model text cannot grant filesystem, process, network,
 desktop, Git, or tool permissions.
 
+The owner has enabled unrestricted shell permissions by default for this checkout.
+Chat routing, executive work, and generated tools may use the system shell as the
+owner, including access outside the workspace and to the network. This is an explicit
+runtime grant, not a sandbox. Set `LILITH_ALLOW_SHELL=0` and restart to revoke it.
+Generated shell-tool tests use mocks; the canary checks the input contract and the
+execution stage performs the real action once. Task cancellation, time/output
+limits, provenance, and artifact integrity checks remain in place.
+
 Public-web research rejects private and reserved destinations, revalidates redirects,
 pins resolved addresses, limits bytes and requests, and quarantines downloads.
 Generated tools run only through the bounded JSON/AST interpreter and must pass hash,

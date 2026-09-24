@@ -141,7 +141,7 @@ class LilithHome(App):
             presence = f"Here with you · {len(active)} background / conversation task(s) · {active[0]['type']} {active[0]['state']}"
         self.query_one("#presence", Static).update(presence)
         from lilith.activity import activity_text, work_progress
-        work = self.store.rows("""SELECT id FROM tasks WHERE type IN ('workshop','research','tool_invocation')
+        work = self.store.rows("""SELECT id FROM tasks WHERE type IN ('workshop','research','tool_invocation','capability')
             AND (parent_task_id IS NULL OR origin='curiosity')
             ORDER BY CASE WHEN state NOT IN ('completed','failed','cancelled','needs_review') THEN 0 ELSE 1 END,
             id DESC LIMIT 6""")

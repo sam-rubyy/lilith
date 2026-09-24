@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
 from lilith.migrations import migrate
+from lilith.redaction import audit_message
 
 
 def utc_now() -> str:
@@ -25,11 +27,26 @@ class Database:
             timeout=30,
         )
 
-        with self.lock:
-            self.connection.execute("PRAGMA journal_mode = WAL")
-            self.connection.execute("PRAGMA foreign_keys = ON")
-            self.connection.execute("PRAGMA busy_timeout = 30000")
-            migrate(self.connection, utc_now())
+        try:
+            with self.lock:
+                self.connection.execute("PRAGMA busy_timeout = 30000")
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        self.connection.execute("PRAGMA journal_mode = WAL")
+                        break
+                    except sqlite3.OperationalError as error:
+                        # Concurrent first-open journal changes can return BUSY
+                        # immediately despite the connection's busy timeout.
+                        if (getattr(error, "sqlite_errorcode", 0) & 255 not in
+                                {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} or time.monotonic() >= deadline):
+                            raise
+                        time.sleep(0.05)
+                self.connection.execute("PRAGMA foreign_keys = ON")
+                migrate(self.connection, utc_now())
+        except BaseException:
+            self.connection.close()
+            raise
 
     # ---------------------------------------------------------
     # Audit
@@ -56,7 +73,7 @@ class Database:
                     utc_now(),
                     event_type,
                     actor,
-                    message,
+                    audit_message(message),
                 ),
             )
 
@@ -161,6 +178,8 @@ class Database:
         source: str,
         confidence: float = 1.0,
         importance: float = 0.5,
+        owner_message_id: int | None = None,
+        lilith_message_id: int | None = None,
     ) -> int:
         with self.lock:
             cursor = self.connection.execute(
@@ -171,9 +190,11 @@ class Database:
                     content,
                     source,
                     confidence,
-                    importance
+                    importance,
+                    owner_message_id,
+                    lilith_message_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now(),
@@ -182,6 +203,8 @@ class Database:
                     source,
                     confidence,
                     importance,
+                    owner_message_id,
+                    lilith_message_id,
                 ),
             )
 
@@ -203,7 +226,9 @@ class Database:
                     content,
                     source,
                     confidence,
-                    importance
+                    importance,
+                    owner_message_id,
+                    lilith_message_id
                 FROM memories
                 WHERE active = 1
                 ORDER BY importance DESC, id DESC
@@ -221,6 +246,8 @@ class Database:
                 "source": row[4],
                 "confidence": row[5],
                 "importance": row[6],
+                "owner_message_id": row[7],
+                "lilith_message_id": row[8],
             }
             for row in rows
         ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from lilith.database import Database
 from lilith.model_gateway import OllamaGateway
@@ -39,6 +40,11 @@ Never attribute text from LILITH RESPONSE to the owner. Lilith's metaphors and
 generated stage directions are not factual observations. Self-beliefs must describe
 observed patterns in Lilith's behavior, not claims about the owner. Affect values are
 computational state, not feelings reported by the owner.
+
+Memory content must be an exact, contiguous excerpt from OWNER MESSAGE, preserving
+the owner's wording and context (including negations and qualifications). Do not
+paraphrase it or add interpretations. It will be retained as an owner statement,
+not an independently verified fact. No durable owner memory can come from self-state.
 
 Only create durable memories for information likely to
 matter in future conversations or decisions.
@@ -85,7 +91,8 @@ REFLECTION_SCHEMA = {
             "required": ["type", "content", "evidence_source", "confidence", "importance"],
             "properties": {
                 "type": {"type": "string", "enum": sorted(ALLOWED_MEMORY_TYPES)},
-                "content": {"type": "string", "maxLength": 500},
+                "content": {"type": "string", "minLength": 1, "maxLength": 500,
+                            "description": "Exact contextual excerpt from OWNER MESSAGE; no paraphrase"},
                 "evidence_source": {"type": "string", "enum": ["owner_message"]},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},
@@ -114,6 +121,8 @@ def clamp(
     minimum: float,
     maximum: float,
 ) -> float:
+    if not math.isfinite(value):
+        raise ValueError("Reflection values must be finite")
     return max(
         minimum,
         min(maximum, value),
@@ -141,6 +150,17 @@ class ReflectionEngine:
     ) -> ReflectionOutcome:
         outcome = ReflectionOutcome()
 
+        # IDs come from trusted conversation code, never from the model proposal.
+        for ident, role, content in ((owner_message_id, "user", user_message),
+                                     (lilith_message_id, "assistant", assistant_response)):
+            if ident is not None:
+                with self.database.lock:
+                    row = self.database.connection.execute(
+                        "SELECT role,content FROM chat_messages WHERE id=?", (ident,)
+                    ).fetchone()
+                if type(ident) is not int or row != (role, content):
+                    raise ValueError("Reflection source message does not match saved evidence")
+
         messages = [
             {
                 "role": "system",
@@ -167,6 +187,7 @@ class ReflectionEngine:
         self._apply_memories(
             proposal.get("memories", []),
             outcome,
+            user_message, owner_message_id, lilith_message_id,
         )
 
         self._apply_beliefs(
@@ -206,8 +227,11 @@ class ReflectionEngine:
         self,
         proposals,
         outcome,
+        user_message,
+        owner_message_id,
+        lilith_message_id,
     ):
-        if not isinstance(proposals, list):
+        if not isinstance(proposals, list) or owner_message_id is None:
             return
 
         for item in proposals[:5]:
@@ -223,9 +247,9 @@ class ReflectionEngine:
                 item.get("type", "")
             ).strip().lower()
 
-            content = str(
-                item.get("content", "")
-            ).strip()
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip() or content not in user_message:
+                continue
 
             if (
                 memory_type
@@ -279,6 +303,8 @@ class ReflectionEngine:
                 source="lilith_reflection",
                 confidence=confidence,
                 importance=importance,
+                owner_message_id=owner_message_id,
+                lilith_message_id=lilith_message_id,
             )
 
             outcome.memories_created += 1

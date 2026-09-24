@@ -96,7 +96,9 @@ class ModelArbiter:
                         owner_conversation = connection.execute("""SELECT 1 FROM tasks
                             WHERE type='conversation' AND state NOT IN
                             ('completed','failed','cancelled','needs_review') LIMIT 1""").fetchone()
-                        blocked_by_owner = PRIORITY[role] < PRIORITY[ModelRole.ROUTER] and owner_conversation
+                        owner_inbox = connection.execute("""SELECT 1 FROM inbox
+                            WHERE state IN ('queued','streaming') LIMIT 1""").fetchone()
+                        blocked_by_owner = PRIORITY[role] < PRIORITY[ModelRole.ROUTER] and (owner_conversation or owner_inbox)
                         if lease is None and first and first[0] == request_id and not blocked_by_owner:
                             connection.execute(
                                 "INSERT INTO model_lease VALUES (1,?,?,?,?,?)",
@@ -169,6 +171,28 @@ class ModelArbiter:
                     self._event(connection, "model_lease_released", {
                         "request_id": request_id, "role": role, "task_id": task_id, "state": state,
                     })
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def recover(self):
+        """Called only by a supervisor holding the exclusive runtime lock."""
+        with self.db.lock:
+            connection = self.db.connection
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT id,role,task_id FROM model_requests WHERE state IN ('waiting','active')"
+                ).fetchall()
+                for request_id, role, task_id in rows:
+                    self._event(connection, "model_lease_released", {
+                        "request_id": request_id, "role": role, "task_id": task_id,
+                        "state": "cancelled", "reason": "runtime_restart",
+                    })
+                connection.execute("""UPDATE model_requests SET state='cancelled',released_at=?
+                    WHERE state IN ('waiting','active')""", (utc_now(),))
+                connection.execute("DELETE FROM model_lease")
                 connection.commit()
             except BaseException:
                 connection.rollback()

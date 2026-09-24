@@ -12,14 +12,26 @@ import subprocess
 import sys
 import threading
 import time
+from lilith.redaction import redact_data
 
 
 class CapabilityError(RuntimeError):
     pass
 
 
+def shell_enabled():
+    """Owner configuration grants shell access; model output cannot grant it."""
+    # Enabled by the owner's explicit request for this checkout, for all entrypoints.
+    return os.environ.get("LILITH_ALLOW_SHELL", "1").lower() in {"1", "true", "yes"}
+
+
+def model_capabilities():
+    return READ_ONLY | ({"shell.run"} if shell_enabled() else set())
+
+
 # Required and optional argument types form the public capability contract.
 SPECS = {
+    "shell.run": ({"command": str}, {}),
     "browser.search": ({"query": str}, {}),
     "browser.navigate": ({"url": str}, {}),
     "browser.read": ({"url": str}, {}),
@@ -68,9 +80,11 @@ _LAUNCHED = {}
 
 def _audit_arguments(args):
     """Retain useful shape without persisting credentials or large content."""
+    if not isinstance(args, dict):
+        return {"invalid_type": type(args).__name__}
     safe = {}
     for key, value in args.items():
-        lowered = key.lower()
+        lowered = str(key).lower()
         if key == "environment" and isinstance(value, dict):
             safe[key] = {name: "[redacted]" for name in value}
         elif key == "arguments" and isinstance(value, list):
@@ -126,7 +140,9 @@ class CapabilityBroker:
                 if type(value) is not (required | optional)[key]:
                     raise CapabilityError(f"Invalid type for {key}")
             result = self._dispatch(name, args)
-            self.db.audit("capability_completed", json.dumps({**record, "result": result}), "capability_broker")
+            # Explicit command environments need not be present in this process.
+            secrets = [value for value in args.get("environment", {}).values() if isinstance(value, str)]
+            self.db.audit("capability_completed", json.dumps(redact_data({**record, "result": result}, secrets=secrets)), "capability_broker")
             return result
         except Exception as error:
             detail = str(error) if isinstance(error, CapabilityError) else type(error).__name__
@@ -196,7 +212,18 @@ class CapabilityBroker:
         if name == "tool.invoke":
             from lilith.tasks import TaskStore
             from lilith.tool_registry import ToolRegistry
-            return {"output": ToolRegistry(self.db, TaskStore(self.db)).invoke(a["name"], a["data"], task_id=self.task_id)}
+            return {"output": ToolRegistry(self.db, TaskStore(self.db)).invoke(
+                a["name"], a["data"], task_id=self.task_id,
+                allow_shell="shell.run" in self.allowed, workspace=self.root)}
+        if name == "shell.run":
+            if not shell_enabled():
+                raise CapabilityError("Shell access is disabled by owner configuration")
+            if not a["command"].strip():
+                raise CapabilityError("Shell command must not be empty")
+            # cwd is a starting directory, not a filesystem or network restriction.
+            executable = os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt" else "/bin/bash"
+            arguments = ["/d", "/s", "/c", a["command"]] if os.name == "nt" else ["-c", a["command"]]
+            return self._run(executable, arguments, str(self.root), 120)
         if name.startswith("browser."):
             from lilith.tasks import TaskStore
             from lilith.research import Research

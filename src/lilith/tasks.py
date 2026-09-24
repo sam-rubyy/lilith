@@ -3,6 +3,7 @@ import json
 from contextlib import contextmanager
 
 from lilith.database import utc_now
+from lilith.redaction import error_text, redact_data
 
 ACTIVE = {"planning", "researching", "running", "waiting", "verifying", "reflecting"}
 TERMINAL = {"completed", "failed", "cancelled", "needs_review"}
@@ -27,7 +28,7 @@ class TaskStore:
 
     def _event(self, c, event, payload):
         c.execute("INSERT INTO audit_events(timestamp,event_type,actor,message) VALUES (?,?,?,?)",
-                  (utc_now(), event, "task_engine", json.dumps(payload)))
+                  (utc_now(), event, "task_engine", json.dumps(redact_data(payload))))
 
     def rows(self, sql, args=()):
         with self.db.lock:
@@ -48,10 +49,19 @@ class TaskStore:
                 parent_task_id=None, resumable=False, max_attempts=1, timeout=180):
         if kind not in KINDS or not isinstance(payload, dict):
             raise ValueError("Invalid task type or input")
+        if resumable:
+            from lilith.capabilities import READ_ONLY
+            if kind != "capability" or payload.get("capability") not in READ_ONLY:
+                raise ValueError("Only read-only capability tasks may be resumable")
         if not 0 <= priority <= 100 or not 1 <= max_attempts <= 5 or not 1 <= timeout <= 900:
             raise ValueError("Invalid task limits")
         now = utc_now()
         with self.transaction() as c:
+            if parent_task_id is not None:
+                parent = c.execute("SELECT state,cancel_requested FROM tasks WHERE id=?",
+                                   (parent_task_id,)).fetchone()
+                if not parent or parent[1] or parent[0] in {"failed", "cancelled", "needs_review"}:
+                    raise ValueError("Cannot enqueue work for an interrupted parent")
             if goal_id is not None:
                 goal = c.execute("SELECT status FROM goals WHERE id=?", (goal_id,)).fetchone()
                 if not goal or goal[0] != "active":
@@ -77,7 +87,7 @@ class TaskStore:
             now = utc_now()
             c.execute("""UPDATE tasks SET state='running',worker=?,started_at=?,updated_at=?,
                 attempt_count=attempt_count+1 WHERE id=?""", (worker, now, now, row[0]))
-            c.execute("INSERT OR REPLACE INTO workers VALUES (?,?,?,?)", (worker, row[0], now, "running"))
+            c.execute("INSERT OR REPLACE INTO workers(id,task_id,heartbeat,state) VALUES (?,?,?,?)", (worker, row[0], now, "running"))
             self._event(c, "task_started", {"task_id": row[0], "worker": worker})
         return self.get(row[0])
 
@@ -85,20 +95,24 @@ class TaskStore:
         if state not in ACTIVE | TERMINAL:
             raise ValueError("Invalid task state")
         with self.transaction() as c:
-            row = c.execute("SELECT state,goal_id,cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if not row or row[0] not in ACTIVE:
-                raise ValueError("Only active tasks can transition")
-            if row[2] and state == "completed":
-                state = "needs_review"
-            now = utc_now()
-            c.execute("UPDATE tasks SET state=?,updated_at=?,finished_at=?,result=COALESCE(?,result),error=? WHERE id=?",
-                      (state, now, now if state in TERMINAL else None,
-                       json.dumps(result) if result is not None else None, error, task_id))
-            self._event(c, "task_transition", {"task_id": task_id, "from": row[0], "to": state, "error": error})
-            if row[1] and state in TERMINAL:
-                c.execute("UPDATE goals SET status=?,progress=?,updated_at=? WHERE id=? AND status='active'",
-                          ("completed" if state == "completed" else "needs_review",
-                           1 if state == "completed" else 0, now, row[1]))
+            self._transition(c, task_id, state, result=result, error=error)
+
+    def _transition(self, c, task_id, state, *, result=None, error=None):
+        error = error_text(error) if error is not None else None
+        row = c.execute("SELECT state,goal_id,cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row or row[0] not in ACTIVE:
+            raise ValueError("Only active tasks can transition")
+        if row[2] and state == "completed":
+            state = "needs_review"
+        now = utc_now()
+        c.execute("UPDATE tasks SET state=?,updated_at=?,finished_at=?,result=COALESCE(?,result),error=? WHERE id=?",
+                  (state, now, now if state in TERMINAL else None,
+                   json.dumps(result) if result is not None else None, error, task_id))
+        self._event(c, "task_transition", {"task_id": task_id, "from": row[0], "to": state, "error": error})
+        if row[1] and state in TERMINAL:
+            c.execute("UPDATE goals SET status=?,progress=?,updated_at=? WHERE id=? AND status='active'",
+                      ("completed" if state == "completed" else "needs_review",
+                       1 if state == "completed" else 0, now, row[1]))
 
     def cancel(self, task_id):
         with self.transaction() as c:
@@ -117,17 +131,23 @@ class TaskStore:
             self.cancel(child["id"])
 
     def interrupted(self, task_id, reason):
-        task = self.get(task_id)
-        if task["state"] not in ACTIVE:
-            return
-        if task["resumable"] and not task["cancel_requested"] and task["attempt_count"] < task["max_attempts"]:
-            with self.transaction() as c:
+        reason = error_text(reason)
+        # Read and decide under the same write transaction: cancellation or worker
+        # completion must never be overwritten by a retry based on a stale snapshot.
+        with self.transaction() as c:
+            task = self.get(task_id)
+            if task["state"] not in ACTIVE:
+                return
+            from lilith.capabilities import READ_ONLY
+            safe = (task["resumable"] and task["type"] == "capability"
+                    and task["input"].get("capability") in READ_ONLY)
+            if safe and not task["cancel_requested"] and task["attempt_count"] < task["max_attempts"]:
                 c.execute("UPDATE tasks SET state='queued',worker=NULL,updated_at=?,error=? WHERE id=?",
                           (utc_now(), reason, task_id))
                 self._event(c, "task_retry", {"task_id": task_id, "reason": reason})
-        else:
-            self.transition(task_id, "cancelled" if task["resumable"] and task["cancel_requested"]
-                            else "failed" if task["resumable"] else "needs_review", error=reason)
+            else:
+                state = "cancelled" if safe and task["cancel_requested"] else "failed" if safe else "needs_review"
+                self._transition(c, task_id, state, error=reason)
 
     def recover(self):
         for row in self.rows("""SELECT id FROM tasks WHERE state NOT IN ('queued','completed','failed','cancelled','needs_review')

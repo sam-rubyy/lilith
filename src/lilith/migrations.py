@@ -113,6 +113,14 @@ MIGRATIONS = (
     Migration(2, "model_arbitration", MODEL_ARBITRATION),
     Migration(3, "conversation_telemetry", CONVERSATION_TELEMETRY),
     Migration(4, "worker_logs", WORKER_LOGS),
+    Migration(5, "memory_message_provenance", (
+        "ALTER TABLE memories ADD COLUMN owner_message_id INTEGER REFERENCES chat_messages(id)",
+        "ALTER TABLE memories ADD COLUMN lilith_message_id INTEGER REFERENCES chat_messages(id)",
+    )),
+    Migration(6, "worker_process_identity", (
+        "ALTER TABLE workers ADD COLUMN pid INTEGER",
+        "ALTER TABLE workers ADD COLUMN process_created REAL",
+    )),
 )
 
 

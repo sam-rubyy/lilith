@@ -13,8 +13,12 @@ boundaries below when making changes.
 - `capabilities.py` is the authority boundary. A model response can propose only
   capabilities already granted by trusted runtime code; it cannot grant itself access.
 - `research.py` treats all web content as untrusted data.
-- Generated tools remain inside the restricted AST interpreter. Never replace it
-  with `exec`, `eval`, or a generic model-controlled shell.
+- Generated tools retain the AST interpreter. The owner explicitly enabled full
+  shell access: `shell.run` and the generated-tool `shell(command)` helper execute
+  under the owner's OS account without a command allowlist or workspace confinement.
+  `capabilities.py` owns this grant; `LILITH_ALLOW_SHELL=0` revokes it. Models cannot
+  override a revoked grant. Shell calls are mocked in generated tests, execute only
+  once for real input, and interrupted shell work must never replay automatically.
 
 ## Development and tests
 

@@ -40,6 +40,21 @@ CMP = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE
        ast.Is: operator.is_, ast.IsNot: operator.is_not}
 HELPERS = {"len", "str", "int", "float", "bool", "abs", "round", "min", "max", "sum", "sorted", "range", "enumerate",
            "get", "keys", "values", "items", "lower", "upper", "strip", "split", "join", "replace", "json_loads", "json_dumps", "fail"}
+HELPERS.add("shell")
+
+SHELL_CONTRACT = """Owner-granted extension: shell(command) runs a command string through the
+system shell with the owner's full filesystem, process, and network permissions.
+There is no command allowlist or workspace confinement. The starting directory is
+the workspace. Return value: {'returncode': integer, 'output': combined stdout/stderr}.
+Use get(result, 'returncode') and get(result, 'output'); attributes remain unavailable.
+Use shell for host tasks, including installed programs or Python through python -c.
+Never claim a command succeeded without checking returncode. Jobs remain cancellable;
+each command has a 120-second timeout and bounded captured output.
+For tests, provide shell_calls: [{"command": "exact expected command", "result":
+{"returncode": 0, "output": "fake output"}}]. These are ordered mocks, not commands
+to execute. Include a nonzero returncode test. Only final execution uses a real shell.
+Do not interpolate untrusted strings into commands without correct shell quoting.
+"""
 NODES = {ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Assign, ast.For, ast.If, ast.Return,
          ast.Break, ast.Continue, ast.Expr, ast.Name, ast.Load, ast.Store, ast.Constant, ast.List,
          ast.Tuple, ast.Dict, ast.Subscript, ast.Slice, ast.BinOp, ast.UnaryOp, ast.UAdd, ast.USub,
@@ -143,9 +158,10 @@ class LoopContinue(Exception):
 
 
 class Sandbox:
-    def __init__(self, *, operations=20000, seconds=2):
+    def __init__(self, *, operations=20000, seconds=2, shell=None):
         self.limit = min(20000, operations)
         self.seconds = min(2, seconds)
+        self.shell = shell
 
     def tick(self):
         self.remaining -= 1
@@ -256,6 +272,17 @@ class Sandbox:
         return bounded(value)
 
     def call(self, name, args):
+        if name == "shell":
+            if self.shell is None:
+                raise SandboxError("This tool has no shell grant")
+            if len(args) != 1 or not isinstance(args[0], str):
+                raise SandboxError("shell expects one command string")
+            started = time.monotonic()
+            try:
+                return self.shell(args[0])
+            finally:
+                # The broker and supervisor bound host work separately from AST CPU time.
+                self.deadline += time.monotonic() - started
         safe = {"len": len, "str": str, "int": int, "float": float, "bool": bool, "abs": abs,
                 "round": round, "min": min, "max": max, "sum": sum, "sorted": sorted}
         if name in safe:

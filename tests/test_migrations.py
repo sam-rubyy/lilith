@@ -78,6 +78,9 @@ class MigrationTests(unittest.TestCase):
                 "SELECT content FROM chat_messages"
             ).fetchall(), [("keep me",)])
             self.assertEqual(db.connection.execute("SELECT content FROM memories").fetchone()[0], "keep this memory")
+            self.assertEqual(db.connection.execute(
+                "SELECT owner_message_id,lilith_message_id FROM memories"
+            ).fetchone(), (None, None))
             self.assertEqual(db.connection.execute("SELECT title FROM goals WHERE id=7").fetchone()[0], "legacy goal")
             self.assertEqual(db.connection.execute("SELECT state FROM tasks WHERE id=9").fetchone()[0], "completed")
             self.assertEqual(db.connection.execute("SELECT title FROM research_sources").fetchone()[0], "Example")
@@ -106,6 +109,22 @@ class MigrationTests(unittest.TestCase):
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0], 0)
         connection.close()
+
+    def test_memory_provenance_survives_reopen_and_enforces_foreign_keys(self):
+        db = Database(self.path)
+        owner = db.save_message("user", "I like robotics.")
+        assistant = db.save_message("assistant", "Hello")
+        db.save_memory("preference", "I like robotics.", "lilith_reflection",
+                       owner_message_id=owner, lilith_message_id=assistant)
+        db.close()
+        db = Database(self.path)
+        try:
+            self.assertEqual(db.recent_memories()[0]["owner_message_id"], owner)
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.save_memory("preference", "bad", "lilith_reflection", owner_message_id=999)
+            db.connection.rollback()
+        finally:
+            db.close()
 
     def test_concurrent_openers_do_not_apply_a_migration_twice(self):
         barrier = threading.Barrier(3)

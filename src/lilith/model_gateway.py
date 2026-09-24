@@ -54,14 +54,10 @@ class OllamaGateway:
                 return json.loads(body.decode("utf-8"))
 
         except urllib.error.HTTPError as error:
-            body = error.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
+            error.close()
             raise RuntimeError(
                 f"Ollama returned HTTP "
-                f"{error.code}: {body}"
+                f"{error.code}"
             ) from error
 
         except urllib.error.URLError as error:
@@ -88,7 +84,7 @@ class OllamaGateway:
 
         except (KeyError, TypeError) as error:
             raise RuntimeError(
-                f"Unexpected Ollama response: {data}"
+                "Unexpected Ollama response structure"
             ) from error
 
     def chat_stream(self, messages: list[Message]):
@@ -149,6 +145,5 @@ class OllamaGateway:
             json.JSONDecodeError,
         ) as error:
             raise RuntimeError(
-                "Model returned invalid JSON object: "
-                f"{str(data.get('message', {}).get('content', ''))[:1000]}"
+                "Model returned an invalid JSON object"
             ) from error

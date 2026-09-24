@@ -5,6 +5,7 @@ from pathlib import Path
 
 from lilith.config import get_model_name
 from lilith.migrations import current_version
+from lilith.capabilities import shell_enabled
 
 
 def health_snapshot(store, *, runtime=None, settings=None, supervisor_error=None):
@@ -19,7 +20,8 @@ def health_snapshot(store, *, runtime=None, settings=None, supervisor_error=None
                       "task_id": active["task_id"] if active else None,
                       "worker_id": active["id"] if active else None})
     now = datetime.now(timezone.utc)
-    stale = [row for row in workers if (now - datetime.fromisoformat(row["heartbeat"])).total_seconds() > 60]
+    stale = [row for row in workers if row["state"] == "running"
+             and (now - datetime.fromisoformat(row["heartbeat"])).total_seconds() > 60]
     lease = store.rows("SELECT role,request_id,acquired_at,heartbeat,expires_at FROM model_lease WHERE id=1")
     queue = store.rows("""SELECT role,priority,COUNT(*) AS count FROM model_requests
                            WHERE state='waiting' GROUP BY role,priority ORDER BY priority DESC""")
@@ -37,6 +39,7 @@ def health_snapshot(store, *, runtime=None, settings=None, supervisor_error=None
         "service": runtime or {"state": "unknown"},
         "supervisor_error": supervisor_error,
         "model": get_model_name(),
+        "shell_access": shell_enabled(),
         "model_queue": queue,
         "active_model_role": lease[0]["role"] if lease else None,
         "model_lease": lease[0] if lease else None,

@@ -62,7 +62,7 @@ class RuntimeTests(unittest.TestCase):
             second.close()
 
     def test_restart_safe_retry_and_unsafe_review(self):
-        safe = self.store.enqueue("capability", {}, resumable=True, max_attempts=2)
+        safe = self.store.enqueue("capability", {"capability": "filesystem.read", "arguments": {"path": "a"}}, resumable=True, max_attempts=2)
         unsafe = self.store.enqueue("reflection", {})
         self.store.claim("a", ["capability"])
         self.store.claim("b", ["reflection"])
@@ -85,6 +85,35 @@ class RuntimeTests(unittest.TestCase):
         self.store.cancel(active)
         self.store.transition(active, "completed")
         self.assertEqual(self.store.get(active)["state"], "needs_review")
+
+    def test_side_effecting_work_cannot_opt_into_replay(self):
+        for kind, payload in (("journal", {}), ("reflection", {}),
+                              ("capability", {"capability": "filesystem.write"})):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "read-only"):
+                self.store.enqueue(kind, payload, resumable=True)
+        ident = self.store.enqueue("capability", {"capability": "filesystem.write"})
+        self.store.claim("worker", ["capability"])
+        # Older databases may already contain an incorrect resumable flag.
+        with self.store.transaction() as c:
+            c.execute("UPDATE tasks SET resumable=1,max_attempts=2 WHERE id=?", (ident,))
+        self.store.recover()
+        self.assertEqual(self.store.get(ident)["state"], "needs_review")
+
+    def test_cancelled_parent_cannot_enqueue_late_children(self):
+        parent = self.store.enqueue("curiosity", {})
+        self.store.claim("parent", ["curiosity"])
+        self.store.cancel(parent)
+        with self.assertRaisesRegex(ValueError, "interrupted parent"):
+            self.store.enqueue("research", {"query": "plants"}, parent_task_id=parent)
+        self.assertFalse(self.store.rows("SELECT id FROM tasks WHERE parent_task_id=?", (parent,)))
+
+    def test_interrupted_does_not_overwrite_completed_task(self):
+        ident = self.store.enqueue("capability", {"capability": "filesystem.read"},
+                                   resumable=True, max_attempts=2)
+        self.store.claim("reader", ["capability"])
+        self.store.transition(ident, "completed", result={"content": "done"})
+        self.store.interrupted(ident, "late exit notification")
+        self.assertEqual(self.store.get(ident)["state"], "completed")
 
     def test_goal_selection_and_no_duplicate(self):
         for kind in ("owner", "shared", "self_directed", "maintenance"):
@@ -131,6 +160,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("do-not-store", messages)
         self.assertNotIn("private body", messages)
         self.assertIn("[redacted]", messages)
+
+    def test_malformed_capability_arguments_are_audited(self):
+        for args in (None, [], "invalid", {1: "invalid"}):
+            with self.subTest(args=args), self.assertRaises(CapabilityError):
+                self.broker().invoke("filesystem.read", args)
+        self.assertEqual(len(self.store.rows(
+            "SELECT id FROM audit_events WHERE event_type='capability_requested'"
+        )), 4)
+        self.assertEqual(len(self.store.rows(
+            "SELECT id FROM audit_events WHERE event_type='capability_failed'"
+        )), 4)
 
     def test_storage_limit_and_no_overwrite_copy(self):
         b = self.broker(storage_limit=4)
@@ -349,6 +389,14 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(key, snapshot)
         self.assertEqual(snapshot["wal_status"], "wal")
 
+    def test_health_does_not_report_stopped_workers_as_stale(self):
+        with self.store.transaction() as c:
+            for name, state in (("stopped-worker", "stopped"), ("stalled-worker", "running")):
+                c.execute("INSERT INTO workers(id,task_id,heartbeat,state) VALUES (?,NULL,?,?)",
+                          (name, "2000-01-01T00:00:00+00:00", state))
+        stale = health_snapshot(self.store)["stale_workers"]
+        self.assertEqual([row["id"] for row in stale], ["stalled-worker"])
+
     def test_process_inspect_and_stop(self):
         result = self.broker().invoke("process.start", {"command": sys.executable,
             "arguments": ["-c", "import time; time.sleep(30)"], "working_directory": ".",
@@ -368,8 +416,8 @@ class RuntimeTests(unittest.TestCase):
         gui = MagicMock()
         gui.onScreen.return_value = True
         gui.KEYBOARD_KEYS = ["ctrl", "a"]
-        from PIL import Image
-        gui.screenshot.return_value = Image.new("RGB", (4, 4))
+        # Exercise adapter dispatch/storage without importing optional desktop packages.
+        gui.screenshot.return_value.save.side_effect = lambda output, **kwargs: output.write(b"fake PNG")
         with patch.dict(sys.modules, {"pyautogui": gui}):
             b = self.broker()
             b.invoke("desktop.click", {"x": 4, "y": 4})

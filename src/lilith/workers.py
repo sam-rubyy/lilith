@@ -2,7 +2,6 @@
 from dataclasses import asdict
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +10,7 @@ import time
 import traceback
 import uuid
 
-from lilith.capabilities import CapabilityBroker
+from lilith.capabilities import CapabilityBroker, shell_enabled
 from lilith.database import Database, utc_now
 from lilith.executive import Executive
 from lilith.models import ModelRole, gateway
@@ -22,15 +21,12 @@ from lilith.tasks import ACTIVE, TaskStore
 from lilith.research import Research, PublicHTTP
 from lilith.tool_registry import ToolRegistry
 from lilith.workshop import Workshop, start_workshop, reconcile_workshops
+from lilith.redaction import error_text, redact_text
+from lilith.worker_logs import WorkerLog
 
 
 def safe_traceback():
-    text = traceback.format_exc()
-    for key, value in os.environ.items():
-        if value and any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")):
-            text = text.replace(value, "[redacted]")
-    text = re.sub(r"(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[redacted]@", text)
-    return re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text)
+    return redact_text(traceback.format_exc())
 
 
 class RuntimeLock:
@@ -95,7 +91,7 @@ def execute_task(database_path, task_id, workspace, model):
             except Exception as error:
                 with store.transaction() as c:
                     c.execute("UPDATE inbox SET response=?,state='needs_review',error=?,updated_at=? WHERE id=?",
-                              ("".join(chunks), str(error), utc_now(), request_id))
+                              ("".join(chunks), error_text(error), utc_now(), request_id))
                 raise
         elif task["type"] == "curiosity":
             interests = db.get_interests(limit=8)
@@ -146,6 +142,8 @@ def execute_task(database_path, task_id, workspace, model):
                 if store.get(task_id)["cancel_requested"]:
                     raise RuntimeError("Research cancelled")
             role = ModelRole.OWNER_RESEARCH if task["origin"] in {"owner", "conversation"} else ModelRole.BACKGROUND
+            if task["origin"] == "curiosity":
+                role = ModelRole.CURIOSITY
             result = Research(db, store, gateway(db, role, task_id=task_id, check=check),
                               http=PublicHTTP(check=check)).run(task)
             reinforce_curiosity_outcome(db, store, task, result)
@@ -158,7 +156,8 @@ def execute_task(database_path, task_id, workspace, model):
             if store.get(task_id)["state"] not in ACTIVE:
                 return
         elif task["type"] == "tool_invocation":
-            result = ToolRegistry(db, store).invoke(payload["name"], payload["data"], task_id=task_id)
+            result = ToolRegistry(db, store).invoke(payload["name"], payload["data"], task_id=task_id,
+                                                  allow_shell=shell_enabled(), workspace=workspace)
         elif task["type"] == "capability":
             result = CapabilityBroker(db, workspace, allowed=[payload["capability"]], task_id=task_id,
                                       storage_limit=16 * 1048576).invoke(payload["capability"], payload["arguments"])
@@ -201,6 +200,7 @@ class WorkerManager:
         self.interval = poll_interval
         self.stop_event = threading.Event()
         self.children = {}
+        self.logs = {}
         self.thread = None
         self.lock = None
         self.error = None
@@ -208,6 +208,8 @@ class WorkerManager:
     def start(self):
         self.lock = RuntimeLock(self.db.path)
         try:
+            self._recover_processes()
+            ModelArbiter(self.db).recover()
             self.store.recover()
             self.thread = threading.Thread(target=self._loop, name="lilith-supervisor", daemon=True)
             self.thread.start()
@@ -221,15 +223,48 @@ class WorkerManager:
                 self.tick()
                 self.stop_event.wait(self.interval)
         except Exception as error:
-            self.error = str(error)
+            self.error = error_text(error)
             self.db.audit("supervisor_failed", str(error), "worker_manager")
         finally:
             for lane, (proc, task, started) in list(self.children.items()):
                 self._terminate(proc)
+                self._finish_log(task, proc, "runtime shutdown")
                 ModelArbiter(self.db).release_task(task["id"])
                 self.store.interrupted(task["id"], "Runtime shutdown interrupted worker")
                 self._heartbeat(task, "stopped")
                 del self.children[lane]
+
+    def _recover_processes(self):
+        """Stop only recorded processes whose creation time still matches the PID."""
+        import psutil
+        for row in self.store.rows("SELECT * FROM workers WHERE state='running' AND pid IS NOT NULL"):
+            try:
+                process = psutil.Process(row["pid"])
+                if process.create_time() != row["process_created"]:
+                    self.db.audit("worker_identity_mismatch", json.dumps({"worker": row["id"], "pid": row["pid"]}))
+                    continue
+                if process.pid in {os.getpid(), os.getppid()}:
+                    raise RuntimeError("Recorded worker identity refers to the runtime; recovery stopped")
+                descendants = process.children(recursive=True)
+                for child in reversed(descendants):
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                process.kill()
+                _, alive = psutil.wait_procs([process, *descendants], timeout=3)
+                if any(p.is_running() and p.status() != psutil.STATUS_ZOMBIE for p in alive):
+                    raise RuntimeError("An interrupted worker could not be stopped; recovery stopped")
+                self.db.audit("orphan_worker_stopped", json.dumps({"worker": row["id"], "task_id": row["task_id"]}))
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.AccessDenied:
+                raise RuntimeError("Cannot inspect or stop an interrupted worker; recovery stopped") from None
+
+    def _finish_log(self, task, proc, reason):
+        log = self.logs.pop(task["worker"], None)
+        if log:
+            log.finish(f"\n[supervisor] exit_code={proc.returncode} reason={reason}\n")
 
     @staticmethod
     def _terminate(proc):
@@ -264,16 +299,6 @@ class WorkerManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    @staticmethod
-    def _bound_log(path, limit=1048576):
-        if not path.exists() or path.stat().st_size <= limit:
-            return
-        with path.open("rb") as source:
-            source.seek(-limit, os.SEEK_END)
-            data = source.read(limit)
-        with path.open("wb") as target:
-            target.write(b"[earlier worker output truncated]\n" + data[-(limit - 35):])
-
     def tick(self):
         for lane, (proc, task, started) in list(self.children.items()):
             current = self.store.get(task["id"])
@@ -287,11 +312,8 @@ class WorkerManager:
                 if current["state"] in ACTIVE and not (current["type"] == "workshop" and current["state"] == "waiting"):
                     self.store.interrupted(task["id"], "Cancelled" if current["cancel_requested"] else
                                            "Task deadline exceeded" if expired else f"Worker exited ({proc.returncode})")
-                log_path = Path(current["worker_log"]) if current.get("worker_log") else self._log_path(task["id"])
-                with log_path.open("a", encoding="utf-8") as log:
-                    log.write(f"\n[supervisor] exit_code={proc.returncode} cancelled={bool(current['cancel_requested'])} "
-                              f"deadline_exceeded={expired}\n")
-                self._bound_log(log_path)
+                self._finish_log(task, proc, "cancelled" if current["cancel_requested"] else
+                                 "deadline exceeded" if expired else "worker exit")
                 self._heartbeat(task, "stopped")
                 del self.children[lane]
             else:
@@ -307,19 +329,31 @@ class WorkerManager:
                 continue
             task = self.store.claim(f"{lane}-{uuid.uuid4().hex[:8]}", kinds)
             if task:
+                proc = None
                 try:
-                    # Explicit stdin isolation is essential for a worker launched from
-                    # a Windows console or from a parent with piped interactive input.
+                    # The private pipe is a launch gate, never interactive owner input.
+                    # EOF before approval makes a newly orphaned worker exit unused.
                     log_path = self._log_path(task["id"])
-                    self._bound_log(log_path)
                     with self.store.transaction() as c:
                         c.execute("UPDATE tasks SET worker_log=? WHERE id=?", (str(log_path), task["id"]))
-                    with log_path.open("ab") as log:
-                        proc = subprocess.Popen([sys.executable, "-B", "-u", "-m", "lilith.workers", str(self.db.path),
-                                                 str(task["id"]), self.workspace, self.model],
-                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                    proc = subprocess.Popen([sys.executable, "-B", "-u", "-m", "lilith.workers", str(self.db.path),
+                                             str(task["id"]), self.workspace, self.model, "--managed"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                    self.logs[task["worker"]] = WorkerLog(log_path, proc.stdout)
+                    import psutil
+                    created = psutil.Process(proc.pid).create_time()
+                    with self.store.transaction() as c:
+                        c.execute("UPDATE workers SET pid=?,process_created=? WHERE id=?",
+                                  (proc.pid, created, task["worker"]))
+                    proc.stdin.write(b"1")
+                    proc.stdin.close()
                 except Exception as error:
+                    if proc is not None:
+                        if proc.stdin and not proc.stdin.closed:
+                            proc.stdin.close()
+                        self._terminate(proc)
+                        self._finish_log(task, proc, "launch failed")
                     self.store.interrupted(task["id"], str(error))
                     self._heartbeat(task, "stopped")
                     raise
@@ -334,4 +368,5 @@ class WorkerManager:
 
 
 if __name__ == "__main__":
-    execute_task(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4])
+    if "--managed" not in sys.argv[5:] or sys.stdin.buffer.read(1) == b"1":
+        execute_task(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4])

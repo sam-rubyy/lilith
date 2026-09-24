@@ -98,7 +98,9 @@ class ServiceTests(unittest.TestCase):
         from lilith.startup import install, remove
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp) / 'Lilith.vbs'
-            with patch('lilith.startup.startup_path', return_value=target):
+            with patch('lilith.startup.startup_path', return_value=target), patch.dict(os.environ, {
+                'LILITH_DATA_DIR': temp, 'LILITH_WORKSPACE': str(Path(temp) / 'workspace'),
+            }):
                 self.assertEqual(install(), target)
                 content = target.read_text(encoding='utf-16')
                 self.assertIn('lilith.service start', content)

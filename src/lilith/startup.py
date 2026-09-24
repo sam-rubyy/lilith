@@ -28,7 +28,7 @@ def install():
               f'env("LILITH_MODEL") = {quote(get_model_name())}']
     for key in ("LILITH_OLLAMA_URL", "LILITH_CONVERSATION_MODEL", "LILITH_ROUTER_MODEL",
                 "LILITH_REFLECTION_MODEL", "LILITH_REASONING_MODEL", "LILITH_RESEARCH_MODEL",
-                "LILITH_WORKSHOP_MODEL"):
+                "LILITH_WORKSHOP_MODEL", "LILITH_ALLOW_SHELL"):
         if os.environ.get(key):
             script.append(f'env("{key}") = {quote(os.environ[key])}')
     script.append(f"shell.Run {quote(command)}, 0, False")
